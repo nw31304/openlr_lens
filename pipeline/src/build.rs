@@ -8,6 +8,7 @@ use tracing::{info, info_span, warn};
 use crate::{
     extent::Bbox,
     http::Client,
+    osm_schema::OsmSchemaMapping,
     partition,
     schema::SchemaMapping,
 };
@@ -23,6 +24,7 @@ pub async fn run_osm(
     pbf_path:    &Path,
     extent_spec: &str,
     bbox:        Option<Bbox>,
+    osm_schema:  &OsmSchemaMapping,
     output:      &Path,
     tile_zoom:   u8,
 ) -> Result<()> {
@@ -48,8 +50,9 @@ pub async fn run_osm(
     let osm_data = {
         let _s = info_span!("osm_extract").entered();
         let pbf_path = pbf_path.to_path_buf();
+        let schema_for_extract = osm_schema.clone();
         let data = tokio::task::spawn_blocking(move || {
-            crate::osm_extract::extract(&pbf_path, bbox)
+            crate::osm_extract::extract(&pbf_path, bbox, &schema_for_extract)
         })
         .await
         .context("osm_extract panicked")??;
@@ -376,7 +379,7 @@ fn find_pmtiles(dir: &Path) -> Option<PathBuf> {
 }
 
 /// Write the manifest for the final merged archive (overwrites any per-partition manifest).
-fn write_top_manifest(
+pub(crate) fn write_top_manifest(
     output_dir:    &Path,
     archive_name:  &str,
     release:       &str,

@@ -37,10 +37,14 @@ function tilesForBounds(bounds, z) {
 // ── App ────────────────────────────────────────────────────────────────────────
 
 async function init() {
-  const manifest = await fetch('/tiles/manifest.json').then(r => r.json());
+  // Allow ?tiles=nz-osm (or any subdir under out/) to pick the tile set.
+  const tilesParam = new URLSearchParams(window.location.search).get('tiles') ?? '';
+  const tilesBase  = tilesParam ? `/tiles/${tilesParam}` : '/tiles';
+
+  const manifest = await fetch(`${tilesBase}/manifest.json`).then(r => r.json());
   console.log('Manifest:', manifest);
 
-  const pmtiles = new PMTiles(`/tiles/${manifest.archive}`);
+  const pmtiles = new PMTiles(`${tilesBase}/${manifest.archive}`);
 
   const tileCache = new Map();   // tileKey → GeoJSON Feature[]
   let   pendingCount = 0;

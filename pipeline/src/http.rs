@@ -1,6 +1,7 @@
+use std::path::Path;
 use std::time::Duration;
-use anyhow::{anyhow, Result};
-use tracing::{debug, warn};
+use anyhow::{anyhow, Context, Result};
+use tracing::{debug, info, warn};
 
 /// Exponential-backoff retry policy. All fields are CLI-configurable; see `cli::Cli`.
 #[derive(Debug, Clone)]
@@ -75,6 +76,51 @@ impl Client {
             Ok(c.inner.get(u).send().await?.error_for_status()?.text().await?)
         })
         .await
+    }
+
+    /// Stream-download `url` to `dest`, logging progress every 50 MB.
+    /// Uses a no-body-read-timeout client so large PBF files (hundreds of MB) don't time out.
+    pub async fn download_to_file(&self, url: &str, dest: &Path) -> Result<u64> {
+        use tokio::io::AsyncWriteExt;
+
+        // No response-body timeout — large files can take many minutes on a slow link.
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| anyhow!("failed to build download client: {e}"))?;
+
+        let mut response = client.get(url).send().await?.error_for_status()?;
+        let total = response.content_length();
+        let total_mb = total.map(|b| b / 1_048_576);
+
+        info!(url, dest = %dest.display(), total_mb, "downloading");
+
+        let mut file = tokio::fs::File::create(dest).await
+            .with_context(|| format!("failed to create {}", dest.display()))?;
+
+        let mut downloaded: u64 = 0;
+        let mut last_logged: u64 = 0;
+
+        while let Some(chunk) = response.chunk().await? {
+            file.write_all(&chunk).await?;
+            downloaded += chunk.len() as u64;
+
+            if downloaded.saturating_sub(last_logged) >= 50 * 1_048_576 {
+                let pct = total.map(|t| format!(" ({:.0}%)", downloaded as f64 / t as f64 * 100.0))
+                               .unwrap_or_default();
+                info!(
+                    downloaded_mb = downloaded / 1_048_576,
+                    total_mb,
+                    progress = %format!("{} MB{pct}", downloaded / 1_048_576),
+                    "downloading"
+                );
+                last_logged = downloaded;
+            }
+        }
+
+        file.flush().await?;
+        info!(total_mb = downloaded / 1_048_576, dest = %dest.display(), "download complete");
+        Ok(downloaded)
     }
 
     async fn retry<F, Fut, T>(&self, url: &str, f: F) -> Result<T>

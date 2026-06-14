@@ -7,6 +7,7 @@ mod http;
 mod merge;
 mod osm_adapt;
 mod osm_extract;
+mod osm_schema;
 mod parquet_meta;
 mod partition;
 mod quantize;
@@ -16,9 +17,10 @@ mod schema;
 mod split;
 mod tile;
 
-use anyhow::Result;
+use std::path::{Path, PathBuf};
+use anyhow::{Context, Result};
 use clap::Parser;
-use cli::{Cli, Command};
+use cli::{Cli, Command, MergeArgs};
 use http::RetryConfig;
 use tracing::{debug, info};
 use tracing_subscriber::{fmt, EnvFilter};
@@ -47,6 +49,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::ListReleases => releases::list_and_print(&http::Client::new(retry)).await?,
+        Command::Merge(args)  => run_merge(args)?,
         Command::Build(args) => {
             if let Some(n) = args.jobs {
                 rayon::ThreadPoolBuilder::new()
@@ -60,11 +63,30 @@ async fn main() -> Result<()> {
 
             match args.pbf {
                 // ── OSM PBF path ──────────────────────────────────────────────
-                Some(pbf_path) => {
+                Some(pbf_str) => {
+                    // Accept a local path or an https:// URL; download if URL.
+                    let pbf_path: PathBuf = if pbf_str.starts_with("http://")
+                        || pbf_str.starts_with("https://")
+                    {
+                        let filename = pbf_str
+                            .rsplit('/')
+                            .next()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("download.osm.pbf");
+                        let dest = PathBuf::from(filename);
+                        info!(url = %pbf_str, dest = %dest.display(), "fetching PBF from URL");
+                        http::Client::new(retry).download_to_file(&pbf_str, &dest).await?;
+                        dest
+                    } else {
+                        PathBuf::from(&pbf_str)
+                    };
+
+                    let osm_schema = osm_schema::load(&args.osm_schema)?;
                     build::run_osm(
                         &pbf_path,
                         &args.extent,
                         bbox,
+                        &osm_schema,
                         &args.output,
                         args.tile_zoom,
                     )
@@ -106,4 +128,80 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+// ── Merge subcommand ──────────────────────────────────────────────────────────
+
+fn run_merge(args: MergeArgs) -> Result<()> {
+    // Resolve each input argument to a concrete .pmtiles path.
+    let mut pmtiles_paths: Vec<PathBuf> = Vec::new();
+    for input in &args.inputs {
+        if input.extension().and_then(|s| s.to_str()) == Some("pmtiles") {
+            anyhow::ensure!(input.exists(), "input not found: {}", input.display());
+            pmtiles_paths.push(input.clone());
+        } else {
+            let found = find_pmtiles_in_dir(input)
+                .with_context(|| format!("no .pmtiles file found in {}", input.display()))?;
+            pmtiles_paths.push(found);
+        }
+    }
+
+    // Read tile_zoom from sibling manifest.json files; verify all inputs agree.
+    let mut tile_zoom: Option<u8> = None;
+    for p in &pmtiles_paths {
+        let manifest_path = p.with_file_name("manifest.json");
+        if let Ok(text) = std::fs::read_to_string(&manifest_path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(z) = v["tile_zoom"].as_u64().map(|z| z as u8) {
+                    match tile_zoom {
+                        None => tile_zoom = Some(z),
+                        Some(prev) => anyhow::ensure!(
+                            prev == z,
+                            "tile_zoom mismatch between inputs ({} vs {}); cannot merge archives built at different zoom levels",
+                            prev, z
+                        ),
+                    }
+                }
+            }
+        }
+    }
+    let tile_zoom = tile_zoom.unwrap_or(12);
+
+    info!(
+        archives  = pmtiles_paths.len(),
+        tile_zoom,
+        output    = %args.output.display(),
+        "merging archives"
+    );
+    for p in &pmtiles_paths {
+        info!(input = %p.display(), "  input archive");
+    }
+
+    if let Some(parent) = args.output.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create output directory {}", parent.display()))?;
+    }
+
+    merge::merge_pmtiles(&pmtiles_paths, &args.output)?;
+
+    // Write manifest.json alongside the output archive.
+    let archive_name = args.output
+        .file_name()
+        .and_then(|s| s.to_str())
+        .context("output path has no filename")?;
+    let output_dir = args.output.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    build::write_top_manifest(output_dir, archive_name, "", &args.extent, tile_zoom)?;
+    info!(manifest = %output_dir.join("manifest.json").display(), "manifest written");
+
+    Ok(())
+}
+
+/// Return the first `.pmtiles` file found directly inside `dir`.
+fn find_pmtiles_in_dir(dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(dir).ok()?.find_map(|e| {
+        let p = e.ok()?.path();
+        if p.extension().and_then(|s| s.to_str()) == Some("pmtiles") { Some(p) } else { None }
+    })
 }

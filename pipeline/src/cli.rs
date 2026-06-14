@@ -34,14 +34,21 @@ pub enum Command {
     ListReleases,
     /// Build a PMTiles archive for a given release and extent.
     Build(BuildArgs),
+    /// Merge multiple regional PMTiles archives into one.
+    Merge(MergeArgs),
 }
 
 #[derive(clap::Args)]
 pub struct BuildArgs {
-    /// OSM PBF file to build from (e.g. a Geofabrik regional extract).
+    /// OSM PBF file or URL to build from (e.g. a Geofabrik regional extract).
+    /// If a https:// URL is given, the file is downloaded to the current directory first.
     /// Use this instead of --release to build from OSM instead of Overture.
     #[arg(long, conflicts_with_all = ["release", "schema"])]
-    pub pbf: Option<PathBuf>,
+    pub pbf: Option<String>,
+
+    /// OSM → OpenLR attribute mapping TOML file (OSM source only).
+    #[arg(long, default_value = "pipeline/schema/osm-default.toml", requires = "pbf")]
+    pub osm_schema: PathBuf,
 
     /// Overture release, e.g. 2026-05-20.0.
     /// Use this instead of --pbf to build from Overture parquet.
@@ -85,4 +92,21 @@ pub struct BuildArgs {
     /// decrease to allow fewer, larger partitions on machines with ample RAM.
     #[arg(long, default_value_t = crate::partition::DEFAULT_BYTES_PER_SEGMENT)]
     pub bytes_per_segment: u64,
+}
+
+#[derive(clap::Args)]
+pub struct MergeArgs {
+    /// Input PMTiles archives or directories containing exactly one .pmtiles file each.
+    /// Mix and match: paths ending in .pmtiles are used directly; directories are searched
+    /// for a single .pmtiles file.
+    #[arg(required = true, num_args = 1..)]
+    pub inputs: Vec<PathBuf>,
+
+    /// Output path for the merged PMTiles archive (e.g. out/world/world.pmtiles).
+    #[arg(long)]
+    pub output: PathBuf,
+
+    /// Extent label written to the output manifest.json [default: world].
+    #[arg(long, default_value = "world")]
+    pub extent: String,
 }

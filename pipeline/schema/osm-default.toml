@@ -1,0 +1,160 @@
+# OSM highway tag → OpenLR attribute mapping.
+# Pass --osm-schema <path> to override.
+#
+# Rules are matched in order; first match wins. A rule with highway = "" is a
+# catch-all. Unknown highway values with no matching rule are excluded (treated
+# as non-vehicular).
+#
+# vehicular defaults to true; set to false to exclude from the routing graph.
+#
+# FRC  0 (motorway/most important) … 7 (least important / non-vehicle)
+# FOW  0=undefined  1=motorway  2=multiple_carriageway  3=single_carriageway
+#      4=roundabout  5=traffic_square  6=slip_road  7=other
+#
+# Note: junction=roundabout → FOW=4 and oneway implied forward are applied at
+# runtime regardless of the fow value here (multi-tag logic, not a lookup).
+# dual_carriageway=yes → FOW=2 override is likewise applied at runtime.
+
+# ── FRC 0 ─────────────────────────────────────────────────────────────────────
+
+[[rules]]
+highway = "motorway"
+frc = 0
+fow = 1   # MOTORWAY
+
+# ── FRC 1 ─────────────────────────────────────────────────────────────────────
+
+[[rules]]
+highway = "motorway_link"
+frc = 1
+fow = 6   # SLIP_ROAD
+
+[[rules]]
+highway = "trunk"
+frc = 1
+fow = 3   # SINGLE_CARRIAGEWAY (dual_carriageway=yes → 2 at runtime)
+
+[[rules]]
+highway = "trunk_link"
+frc = 1
+fow = 6   # SLIP_ROAD
+
+# ── FRC 2 ─────────────────────────────────────────────────────────────────────
+
+[[rules]]
+highway = "primary"
+frc = 2
+fow = 3
+
+[[rules]]
+highway = "primary_link"
+frc = 2
+fow = 6
+
+# ── FRC 3 ─────────────────────────────────────────────────────────────────────
+
+[[rules]]
+highway = "secondary"
+frc = 3
+fow = 3
+
+[[rules]]
+highway = "secondary_link"
+frc = 3
+fow = 6
+
+# ── FRC 4 ─────────────────────────────────────────────────────────────────────
+
+[[rules]]
+highway = "tertiary"
+frc = 4
+fow = 3
+
+[[rules]]
+highway = "tertiary_link"
+frc = 4
+fow = 6
+
+# ── FRC 5 ─────────────────────────────────────────────────────────────────────
+
+[[rules]]
+highway = "yes"
+frc = 5
+fow = 3   # important local road (generic highway=yes)
+
+# ── FRC 6 ─────────────────────────────────────────────────────────────────────
+
+[[rules]]
+highway = "unclassified"
+frc = 6
+fow = 3
+
+# ── FRC 7 vehicular ───────────────────────────────────────────────────────────
+
+[[rules]]
+highway = "residential"
+frc = 7
+fow = 3
+
+[[rules]]
+highway = "living_street"
+frc = 7
+fow = 3
+
+[[rules]]
+highway = "road"
+frc = 7
+fow = 3
+
+[[rules]]
+highway = "track"
+frc = 7
+fow = 3
+
+[[rules]]
+highway = "service"
+frc = 7
+fow = 7
+vehicular = false   # drive-throughs, parking aisles, driveways — not routing roads
+
+# ── FRC 7 non-vehicular ───────────────────────────────────────────────────────
+
+[[rules]]
+highway = "pedestrian"
+frc = 7
+fow = 7
+vehicular = false
+
+[[rules]]
+highway = "footway"
+frc = 7
+fow = 7
+vehicular = false
+
+[[rules]]
+highway = "cycleway"
+frc = 7
+fow = 7
+vehicular = false
+
+[[rules]]
+highway = "path"
+frc = 7
+fow = 7
+vehicular = false
+
+[[rules]]
+highway = "steps"
+frc = 7
+fow = 7
+vehicular = false
+
+[[rules]]
+highway = "bridleway"
+frc = 7
+fow = 7
+vehicular = false
+
+[exclusions]
+area   = ["yes", "true", "1"]
+access = ["private", "no"]
