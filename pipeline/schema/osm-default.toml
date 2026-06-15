@@ -14,6 +14,10 @@
 # Note: junction=roundabout → FOW=4 and oneway implied forward are applied at
 # runtime regardless of the fow value here (multi-tag logic, not a lookup).
 # dual_carriageway=yes → FOW=2 override is likewise applied at runtime.
+#
+# Non-vehicular highway types (track, pedestrian, footway, cycleway, path,
+# steps, bridleway) are not listed — unknown values are dropped by default.
+# Commercial nav maps (TomTom, HERE) don't encode LRPs on these types.
 
 # ── FRC 0 ─────────────────────────────────────────────────────────────────────
 
@@ -89,7 +93,7 @@ highway = "unclassified"
 frc = 6
 fow = 3
 
-# ── FRC 7 vehicular ───────────────────────────────────────────────────────────
+# ── FRC 7 ─────────────────────────────────────────────────────────────────────
 
 [[rules]]
 highway = "residential"
@@ -107,54 +111,15 @@ frc = 7
 fow = 3
 
 [[rules]]
-highway = "track"
-frc = 7
-fow = 3
-
-[[rules]]
 highway = "service"
 frc = 7
 fow = 7
-vehicular = false   # drive-throughs, parking aisles, driveways — not routing roads
+# Parking aisles, driveways, alleys, etc. excluded via [exclusions].service below.
 
-# ── FRC 7 non-vehicular ───────────────────────────────────────────────────────
-
-[[rules]]
-highway = "pedestrian"
-frc = 7
-fow = 7
-vehicular = false
-
-[[rules]]
-highway = "footway"
-frc = 7
-fow = 7
-vehicular = false
-
-[[rules]]
-highway = "cycleway"
-frc = 7
-fow = 7
-vehicular = false
-
-[[rules]]
-highway = "path"
-frc = 7
-fow = 7
-vehicular = false
-
-[[rules]]
-highway = "steps"
-frc = 7
-fow = 7
-vehicular = false
-
-[[rules]]
-highway = "bridleway"
-frc = 7
-fow = 7
-vehicular = false
+# ── Tag-value exclusions ──────────────────────────────────────────────────────
+# A way is dropped if any listed tag has any of the listed values.
 
 [exclusions]
-area   = ["yes", "true", "1"]
-access = ["private", "no"]
+area    = ["yes", "true", "1"]
+access  = ["private", "no"]
+service = ["parking_aisle", "driveway", "alley", "emergency_access", "yard", "spur"]

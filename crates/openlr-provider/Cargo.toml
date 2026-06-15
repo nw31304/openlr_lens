@@ -4,6 +4,11 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
-openlr-graph    = { path = "../openlr-graph" }
+openlr-graph  = { path = "../openlr-graph" }
 serde.workspace     = true
 thiserror.workspace = true
+flate2.workspace    = true
+
+[dev-dependencies]
+openlr-codec   = { path = "../openlr-codec" }
+openlr-engine  = { path = "../openlr-engine" }

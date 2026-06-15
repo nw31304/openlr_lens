@@ -112,9 +112,29 @@ mod tests {
     }
 
     #[test]
-    fn pedestrian_non_vehicular() {
-        let (_, _, veh) = schema().lookup("pedestrian").unwrap();
-        assert!(!veh);
+    fn pedestrian_not_in_schema() {
+        assert!(schema().lookup("pedestrian").is_none());
+    }
+
+    #[test]
+    fn track_not_in_schema() {
+        assert!(schema().lookup("track").is_none());
+    }
+
+    #[test]
+    fn service_vehicular_frc7() {
+        let (frc, _, veh) = schema().lookup("service").unwrap();
+        assert_eq!(frc, 7);
+        assert!(veh, "service roads must be vehicular; subtypes excluded via [exclusions]");
+    }
+
+    #[test]
+    fn service_subtypes_in_exclusions() {
+        let schema = schema();
+        let excls = schema.exclusions.get("service").expect("[exclusions].service must exist");
+        for subtype in &["parking_aisle", "driveway", "alley", "emergency_access"] {
+            assert!(excls.contains(&subtype.to_string()), "service={subtype} must be excluded");
+        }
     }
 
     #[test]
