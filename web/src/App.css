@@ -252,6 +252,10 @@ html, body, #root, .app {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  cursor: grab;
+}
+.seg-info-header:active {
+  cursor: grabbing;
 }
 
 .seg-info-header a {

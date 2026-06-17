@@ -3,6 +3,7 @@ import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { PMTiles } from 'pmtiles';
 import { useStore, getSegmentId, getSegGeomCache, getSegIdToTile, getTileGeomCache } from '../store.js';
+import { useDraggable } from '../hooks.js';
 
 
 function popupStyle(anchor, w = 260, h = 200) {
@@ -95,11 +96,16 @@ export default function MapView({ tilesBase, ready }) {
   const pendingCountRef = useRef(0);
   const pmtilesRef = useRef(null);
   const pulseRef   = useRef(null);
+  const lrpPanelRef = useRef(null);
+  const segPanelRef = useRef(null);
 
   const [status, setStatus] = useState(null);
   const [infoProps, setInfoProps] = useState(null);
   const [infoAnchor, setInfoAnchor] = useState(null);
   const [lrpInfo, setLrpInfo] = useState(null);
+
+  const { pos: lrpPos, onMouseDown: lrpMouseDown, resetPos: lrpResetPos } = useDraggable(lrpPanelRef);
+  const { pos: segPos, onMouseDown: segMouseDown, resetPos: segResetPos } = useDraggable(segPanelRef);
 
   const decodeResult          = useStore(s => s.decodeResult);
   const highlightedSegment    = useStore(s => s.highlightedSegment);
@@ -109,6 +115,10 @@ export default function MapView({ tilesBase, ready }) {
   const setTraceLrpFocus      = useStore(s => s.setTraceLrpFocus);
   const showSegmentLayer      = useStore(s => s.showSegmentLayer);
   const searchRadiusM         = useStore(s => s.params.candidate_search_radius_m);
+
+  // Reset drag position when a new popup target is clicked
+  useEffect(() => { lrpResetPos(); }, [lrpInfo]);   // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { segResetPos(); }, [infoProps]);  // eslint-disable-line react-hooks/exhaustive-deps
 
   // Always-current ref so the highlight effect can read decodeResult without
   // adding it to the dependency array (which would cause both effects to race).
@@ -653,8 +663,9 @@ export default function MapView({ tilesBase, ready }) {
 
       {/* Segment info panel */}
       {infoProps && (
-        <div className="seg-info-panel" style={popupStyle(infoAnchor)}>
-          <header className="seg-info-header">
+        <div ref={segPanelRef} className="seg-info-panel"
+          style={segPos ? { position: 'absolute', left: segPos.left, top: segPos.top, right: 'auto', bottom: 'auto' } : popupStyle(infoAnchor)}>
+          <header className="seg-info-header" onMouseDown={segMouseDown}>
             <span>
               Segment{' '}
               {infoProps.osm_way_id != null
@@ -697,8 +708,9 @@ export default function MapView({ tilesBase, ready }) {
 
       {/* LRP info panel */}
       {lrpInfo && (
-        <div className="seg-info-panel" style={popupStyle(infoAnchor)}>
-          <header className="seg-info-header">
+        <div ref={lrpPanelRef} className="seg-info-panel"
+          style={lrpPos ? { position: 'absolute', left: lrpPos.left, top: lrpPos.top, right: 'auto', bottom: 'auto' } : popupStyle(infoAnchor)}>
+          <header className="seg-info-header" onMouseDown={lrpMouseDown}>
             <span>LRP {lrpInfo.index}</span>
             <button className="seg-info-close" onClick={() => { setLrpInfo(null); setInfoAnchor(null); }}>✕</button>
           </header>

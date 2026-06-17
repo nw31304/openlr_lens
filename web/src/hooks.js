@@ -41,5 +41,5 @@ export function useDraggable(panelRef) {
     e.preventDefault();
   };
 
-  return { pos, onMouseDown };
+  return { pos, onMouseDown, resetPos: () => setPos(null) };
 }
