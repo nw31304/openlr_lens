@@ -333,6 +333,37 @@ html, body, #root, .app {
   flex-shrink: 0;
 }
 
+/* ── Basemap selector ───────────────────────────────────────────────────────── */
+
+.basemap-selector {
+  position: absolute;
+  bottom: 30px;
+  right: 8px;
+  z-index: 8;
+}
+
+.basemap-selector select {
+  background: rgba(10, 10, 20, 0.82);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 6px;
+  color: #e8e8f0;
+  font-size: 12px;
+  padding: 4px 8px;
+  cursor: pointer;
+  outline: none;
+}
+
+.basemap-selector select:hover {
+  border-color: rgba(255, 255, 255, 0.35);
+}
+
+.basemap-selector select option {
+  background: #1a1a2e;
+  color: #e8e8f0;
+}
+
 .seg-layer-btn {
   display: block;
   width: 100%;

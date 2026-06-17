@@ -22,6 +22,54 @@ import { decodeTile } from '../tileDecoder.js';
 const TILE_ZOOM = 12;
 const MIN_LOAD_ZOOM = 10;
 
+// ── Basemap definitions ────────────────────────────────────────────────────────
+
+function rasterStyle(tiles, attribution, maxzoom = 19) {
+  return {
+    version: 8,
+    sources: {
+      basemap: { type: 'raster', tiles, tileSize: 256, attribution, maxzoom },
+    },
+    layers: [{ id: 'basemap', type: 'raster', source: 'basemap' }],
+  };
+}
+
+const BASEMAPS = [
+  { id: 'liberty',     label: 'Liberty',      style: 'https://tiles.openfreemap.org/styles/liberty' },
+  { id: 'bright',      label: 'Bright',       style: 'https://tiles.openfreemap.org/styles/bright' },
+  { id: 'positron',    label: 'Positron',     style: 'https://tiles.openfreemap.org/styles/positron' },
+  { id: 'osm',         label: 'OSM',          style: rasterStyle(
+    ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+    '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors') },
+  { id: 'carto-light', label: 'Carto Light',  style: rasterStyle(
+    ['https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
+     'https://b.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
+     'https://c.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png'],
+    '© <a href="https://carto.com/attributions">CARTO</a> © <a href="https://www.openstreetmap.org/copyright">OSM</a> contributors') },
+  { id: 'carto-dark',  label: 'Carto Dark',   style: rasterStyle(
+    ['https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
+     'https://b.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
+     'https://c.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png'],
+    '© <a href="https://carto.com/attributions">CARTO</a> © <a href="https://www.openstreetmap.org/copyright">OSM</a> contributors') },
+  { id: 'satellite',   label: 'Satellite',    style: rasterStyle(
+    ['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],
+    'Tiles © Esri — Esri, Maxar, Earthstar Geographics') },
+];
+
+// Custom sources/layers to preserve across basemap switches via transformStyle.
+const CUSTOM_SOURCES = new Set([
+  'olr-segments', 'decoded-path', 'lrp-markers',
+  'offset-uncertainty', 'lrp-bearing', 'highlighted-segment', 'trace-segment',
+]);
+const CUSTOM_LAYER_IDS = new Set([
+  'olr-frc0','olr-frc1','olr-frc2','olr-frc3','olr-frc4','olr-frc5','olr-frc6','olr-frc7',
+  'olr-highlight', 'decoded-path-line', 'lrp-markers-circle',
+  'offset-uncertainty-halo', 'offset-uncertainty-dash',
+  'lrp-bearing-fill', 'lrp-bearing-outline',
+  'highlighted-segment-halo', 'highlighted-segment-line',
+  'trace-segment-halo', 'trace-segment-line',
+]);
+
 const FRC_COLOR = ['#e8002d', '#ff7700', '#e8c800', '#00aa44',
                    '#00aaff', '#0055ff', '#aa00ff', '#888888'];
 const FRC_LABEL = ['0 · Motorway', '1 · Trunk/Primary', '2 · Secondary', '3 · Tertiary',
@@ -103,6 +151,7 @@ export default function MapView({ tilesBase, ready }) {
   const [infoProps, setInfoProps] = useState(null);
   const [infoAnchor, setInfoAnchor] = useState(null);
   const [lrpInfo, setLrpInfo] = useState(null);
+  const [basemap, setBasemap] = useState('liberty');
 
   const { pos: lrpPos, onMouseDown: lrpMouseDown, resetPos: lrpResetPos } = useDraggable(lrpPanelRef);
   const { pos: segPos, onMouseDown: segMouseDown, resetPos: segResetPos } = useDraggable(segPanelRef);
@@ -323,6 +372,30 @@ export default function MapView({ tilesBase, ready }) {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // ── Basemap switch ───────────────────────────────────────────────────────────
+
+  function handleBasemapChange(id) {
+    const map = mapRef.current;
+    const entry = BASEMAPS.find(b => b.id === id);
+    if (!map || !entry) return;
+    map.setStyle(entry.style, {
+      transformStyle: (previous, next) => ({
+        ...next,
+        sources: {
+          ...next.sources,
+          ...Object.fromEntries(
+            Object.entries(previous.sources ?? {}).filter(([k]) => CUSTOM_SOURCES.has(k))
+          ),
+        },
+        layers: [
+          ...next.layers,
+          ...(previous.layers ?? []).filter(l => CUSTOM_LAYER_IDS.has(l.id)),
+        ],
+      }),
+    });
+    setBasemap(id);
+  }
 
   // ── Tile loading ─────────────────────────────────────────────────────────────
 
@@ -769,15 +842,26 @@ export default function MapView({ tilesBase, ready }) {
         </div>
       )}
 
-      {/* FRC Legend */}
-      <div className="frc-legend">
-        <h4>FRC</h4>
-        {FRC_LABEL.map((label, i) => (
-          <div key={i} className="legend-row">
-            <div className="legend-swatch" style={{ background: FRC_COLOR[i] }} />
-            <span>{label}</span>
-          </div>
-        ))}
+      {/* FRC Legend — only shown when the Segs overlay is active */}
+      {showSegmentLayer && (
+        <div className="frc-legend">
+          <h4>FRC</h4>
+          {FRC_LABEL.map((label, i) => (
+            <div key={i} className="legend-row">
+              <div className="legend-swatch" style={{ background: FRC_COLOR[i] }} />
+              <span>{label}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Basemap selector */}
+      <div className="basemap-selector">
+        <select value={basemap} onChange={e => handleBasemapChange(e.target.value)}>
+          {BASEMAPS.map(b => (
+            <option key={b.id} value={b.id}>{b.label}</option>
+          ))}
+        </select>
       </div>
     </div>
   );
