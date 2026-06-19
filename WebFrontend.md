@@ -54,11 +54,15 @@ Uses **Zustand**. All shared UI state lives here.
 | `showParams` | bool | ParamsPanel visible |
 | `showTrace` | bool | TracePanel visible |
 | `showSegmentLayer` | bool | OLR segment FRC layer visible |
+| `showReplay` | bool | ReplayPanel visible |
 | `decoding` | bool | Decode in progress |
 | `decodeResult` | object \| null | Last decode result from WASM |
 | `highlightedSegment` | `{tile, local_index}` \| null | Segment highlighted from ResultPanel |
 | `traceHighlightSegIds` | `number[]` \| null | Segment IDs to highlight from TracePanel |
 | `traceLrpFocus` | `{lon, lat, index, …, _tick}` \| null | LRP to pan to (with `_tick` to allow re-click) |
+| `replaySteps` | `Step[]` | Pre-built display steps from `buildReplaySteps()` |
+| `replayStats` | `{maxG, totalNodes, phases}` \| null | Summary stats for the replay (used for colour normalisation and timeline phases) |
+| `replayStep` | number | Current display step index (0-based) |
 
 ### Zustand `persist` and the `merge` function
 
@@ -127,17 +131,31 @@ operate on custom sources (e.g. `trace-segment`, `highlighted-segment`) must gua
 
 ## 5. MapLibre sources and layers (`Map.jsx`)
 
-Six GeoJSON sources, added on the `map.on('load')` callback:
+GeoJSON sources added on the `map.on('load')` callback, split into permanent and replay groups:
+
+**Permanent sources:**
 
 | Source | Layer(s) | Purpose |
 |---|---|---|
 | `olr-segments` | `olr-frc0` … `olr-frc7`, `olr-highlight` | All road segments, FRC-coloured; toggled by Segs button |
 | `decoded-path` | `decoded-path-line` | Solid decoded path (cyan), trimmed at `pos_offset_ub` / `neg_offset_ub` |
-| `decoded-path-uncertainty-pos` | `decoded-path-uncertainty-pos-line` | Dashed cyan uncertainty cap at path start: from `pos_offset_lb` to `pos_offset_ub` |
-| `decoded-path-uncertainty-neg` | `decoded-path-uncertainty-neg-line` | Dashed cyan uncertainty cap at path end: from `neg_offset_ub` to `neg_offset_lb` |
+| `decoded-path-uncertainty-pos` | `decoded-path-uncertainty-pos-line` | Dashed cyan uncertainty cap at path start |
+| `decoded-path-uncertainty-neg` | `decoded-path-uncertainty-neg-line` | Dashed cyan uncertainty cap at path end |
 | `lrp-markers` | `lrp-markers-circle` | LRP point markers (purple circles) |
-| `highlighted-segment` | `highlighted-segment-halo`, `highlighted-segment-line` | Segment highlighted from ResultPanel or TracePanel single click; animated pulse halo |
+| `highlighted-segment` | `highlighted-segment-halo`, `highlighted-segment-line` | Segment highlighted from ResultPanel or TracePanel; animated pulse halo |
 | `trace-segment` | `trace-segment-halo`, `trace-segment-line` | Orange highlight driven by TracePanel segment buttons |
+
+**Replay sources** (all toggled via `visibility` when `showReplay` changes):
+
+| Source | Layer(s) | Purpose |
+|---|---|---|
+| `replay-radius` | `replay-radius-fill`, `replay-radius-line` | LRP candidate search radius ring (dashed purple) |
+| `replay-route` | `replay-route-line` | Found leg route (gold line); pulsed for 3 s when `route_found` fires |
+| `replay-candidates` | `replay-candidates-circle` | Candidate snap points, coloured by gate result (see §15) |
+| `replay-cloud` | `replay-cloud-circle` | A* expanded-node cloud; colour by `g_m/maxG` ramp (blue→yellow→red) |
+| `replay-frontier` | `replay-frontier-circle` | Latest `FRONTIER_SIZE=25` A* nodes; sinusoidal pulse animation |
+| `replay-leg` | `replay-leg-from`, `replay-leg-to` | Green (from) / red (to) leg endpoint markers |
+| `replay-flash` | `replay-flash-ring` | Sonar-ping ring on the newest A* node; expands and fades over 2 s |
 
 ### Offset uncertainty visualization
 
@@ -225,11 +243,11 @@ WASM segment references.
 
 Contains:
 - **OpenLR input**: text input; Enter key triggers decode
-- **Preset selector**: Permissive / Default / Strict; calls `applyPreset()`
-- **Segs toggle** (`○/● Segs`): shows/hides FRC segment layer
-- **Params toggle** (`⚙`): shows/hides ParamsPanel
-- **Trace toggle** (`⚡`): shows/hides TracePanel
+- **Gear menu** (`⚙`): dropdown with toggle rows for Road segments, Trace panel, and Replay; plus a **Trace level** button group (Off / Summary / Full) that sets `params.trace_level`; plus Parameters… and Reset to defaults actions
+- **▶ Replay button**: appears only when `replaySteps.length > 0`; toggles `showReplay`
 - **Decode button**: calls `runDecode()`; disabled while `decoding` is true
+
+`trace_level` must be set to **Full** before decoding to get `AStarNodeExpanded` events, which are required for A\* visualisation in the replay. Summary level records candidates and routing outcomes only.
 
 ---
 
@@ -365,27 +383,136 @@ guard for intermediate trace events where the interval might differ.
 
 ---
 
-## 13. File map
+## 13. Decode replay system
+
+### Overview
+
+After a decode the `DecodeTrace.events` array is converted into a visual step-by-step replay. Two new files implement this:
+
+- **`replayEngine.js`** — pure transformation logic (no MapLibre dependency)
+- **`ReplayPanel.jsx`** — the panel UI: ◀ / ▶ buttons, step counter, scrubable timeline
+
+The trace engine emits events; the replay engine converts them into *display steps* and accumulates a mutable *visual state* that `Map.jsx` maps to GeoJSON sources.
+
+### `replayEngine.js`
+
+**`buildReplaySteps(events)`** converts the flat `events` array into a `{ steps, stats }` pair:
+- One step per `CandidateSearchStarted`, `CandidatesRanked`, `RouteSearchStarted`, and `RouteFound`/`RouteFailed`/`DnpChecked`/`OffsetApplied`/`DecodeComplete` event
+- `AStarNodeExpanded` events are grouped into batches of `ASTAR_BATCH=1` (one node per display step)
+- `CandidateEvaluated` and `AStarEdgeSkipped` events are discarded (summary data only)
+- `stats.maxG` normalises A\* node colours; `stats.phases` drives the timeline colour strips
+
+**`emptyState()` / `applyStep(state, step, maxG)`** — incrementally mutate the visual state object. `applyStep` is O(1) per call; forward stepping is O(1) total. Backward jumps fall back to `computeVisualState` (O(N) full replay from step 0).
+
+**Visual state fields:**
+
+| Field | Purpose |
+|---|---|
+| `searchRadius` | Current LRP search circle: `{ lon, lat, radiusM, lrpIdx }` |
+| `candidates` | All candidate snap points; each carries full projection + score detail |
+| `astarNodes` | Accumulated A\* expanded nodes; each has a pre-computed `color` |
+| `frontier` | Last 25 A\* nodes (for the pulsing frontier layer) |
+| `currentLeg` | Active leg: `{ leg, fromPt, toPt, fromSegId, toSegId }` |
+| `routeSegIds` | Segment IDs of the most recently found route |
+
+**Candidate `winner` flag**: set to `true` on `route_search_started` for the candidates whose `segment_id` matches `step.from.segment_id` or `step.to.segment_id`. Winners render with a white ring and larger radius in the `replay-candidates-circle` layer.
+
+**`stateToGeoJSON(state)`** converts visual state to `{ radiusFC, candFC, cloudFC, frontierFC, legFC }`. Route geometry (`replay-route`) is built separately in `Map.jsx` using `getSegGeomCache()` / `getSegIdToTile()` / `getTileGeomCache()` (the same two-step fallback as the trace highlight effect).
+
+### Candidate GeoJSON properties
+
+All candidate detail is flattened into GeoJSON feature properties so the click popup can read them without additional lookups:
+
+| Property | Accepted | Rejected |
+|---|---|---|
+| `ctype` | `'accepted'` | `'bearing'` / `'radius'` / `'score'` / `'direction'` / `'other'` |
+| `winner` | true if chosen as leg endpoint | false |
+| `segment_id`, `traversal` | ✓ | if available |
+| `distance_m`, `arc_offset_m`, `bearing_deg` | ✓ | bearing/distance if available |
+| `score_total`, `score_distance`, `score_bearing`, `score_frc`, `score_fow`, `score_wrong_ep`, `score_interior` | ✓ | — |
+| `verdict_json` | — | JSON-stringified `GateVerdict` |
+
+### `ReplayPanel.jsx`
+
+Bottom-anchored panel containing:
+- **◀ / ▶ step buttons** (also ← / → arrow keys)
+- **Step counter**: `N / total · X A* nodes` (A\* badge hidden if 0, which means Summary trace level)
+- **Status line**: human-readable description of the current step
+- **Full-width trace hint bar**: shown when `totalNodes === 0`, prompting the user to set Trace level → Full
+- **Scrubable timeline**: click/drag to jump to any step; colour strips from `replayStats.phases` mark LRP and leg phases
+
+### Map auto-pan behaviour during replay
+
+| Step type | Action |
+|---|---|
+| `search_started` | `map.flyTo()` to LRP at zoom ≥ 15 |
+| `route_search_started` | `map.fitBounds()` between from/to leg endpoints |
+| `astar_batch` | `map.jumpTo()` to latest node at zoom 17 (instant, stays in sync with 30 ms playback) |
+| `route_found` | `map.fitBounds()` to the full route extent; gold route line pulses for 3 s |
+
+### Candidate click popup
+
+Clicking any candidate dot opens a draggable popup (`cand-panel` CSS class) showing:
+- **Accepted**: projection (distance from LRP, arc offset, bearing) + full 7-component score breakdown
+- **Rejected**: human-readable gate failure reason (e.g. "Bearing gate — exceeded by 143.97°") + available projection fields
+- **Chosen** candidates (winners) show a gold ★ badge in the header
+
+### A\* node colour ramp
+
+`nodeColorAt(t)` maps `t = g_m / maxG ∈ [0, 1]` to a CSS hex colour:
+- `t < 0.33`: blue → cyan
+- `0.33 ≤ t < 0.66`: cyan → yellow
+- `t ≥ 0.66`: yellow → red
+
+### Incremental state update (performance)
+
+`Map.jsx` keeps `replayVisualRef` (last visual state) and `replayStepRef` (its step index). On each render:
+- **Forward step**: calls `applyStep` only for new steps — O(1) per step
+- **Backward / scrub**: calls `computeVisualState` from step 0 — O(N), acceptable for scrubbing
+
+This avoids the O(N²) cost of recomputing from step 0 on every step during forward playback with thousands of A\* nodes.
+
+---
+
+## 14. File map
 
 | File | Contents |
 |---|---|
 | `src/main.jsx` | React root mount; `<StrictMode>` wrapper |
 | `src/App.jsx` | Startup, WASM init, tile base URL, component tree |
-| `src/App.css` | All styles (TopBar, panels, map overlays, trace panel) |
-| `src/store.js` | Zustand store; 3 module-level caches; `runDecode()`; PRESETS |
+| `src/App.css` | All styles (TopBar, panels, map overlays, trace panel, replay panel) |
+| `src/store.js` | Zustand store; 3 module-level caches; `runDecode()`; PRESETS; replay state |
+| `src/replayEngine.js` | `buildReplaySteps`, `applyStep`, `emptyState`, `computeVisualState`, `stateToGeoJSON` |
 | `src/tileDecoder.js` | OLRL v2 binary → GeoJSON |
 | `src/wasm.js` | WASM module loader (`initWasm()`) |
 | `src/hooks.js` | `useDraggable` |
-| `src/components/Map.jsx` | MapLibre GL JS; 6 sources; tile loader; highlight effects |
-| `src/components/TopBar.jsx` | Input bar, controls, Decode button |
+| `src/components/Map.jsx` | MapLibre GL JS; all sources/layers; tile loader; highlight + replay effects |
+| `src/components/TopBar.jsx` | Input bar, gear menu, Trace level, ▶ Replay button, Decode button |
 | `src/components/ParamsPanel.jsx` | DecodeParams editor; FRC/FOW penalty tables |
 | `src/components/ResultPanel.jsx` | Decoded segment list; click-to-highlight |
 | `src/components/TracePanel.jsx` | Full decode trace view |
+| `src/components/ReplayPanel.jsx` | Step replay UI: ◀/▶ buttons, step counter, scrubable timeline |
 | `vite.config.js` | Dev server; serve-tiles plugin (HTTP 206 / range support) |
 
 ---
 
-## 14. Known issues / next steps
+## 15. Candidate colour key
+
+| Dot colour | `ctype` value | Meaning |
+|---|---|---|
+| Green (larger, white ring) | `accepted`, `winner: true` | Accepted and chosen as leg endpoint |
+| Green | `accepted`, `winner: false` | Accepted but beaten by another candidate's route cost |
+| Orange | `bearing` | Bearing outside `[LB−τ, UB+τ]` gate |
+| Yellow | `radius` | Outside candidate search radius |
+| Purple | `score` | Total score exceeded `max_candidate_score` |
+| Dark grey | `direction` | Wrong direction (one-way road) |
+| Light grey | `other` | Other / degenerate geometry |
+
+A green dot overlaid with a smaller orange dot at the same location is a bidirectional road where one traversal direction was accepted and the opposite direction failed the bearing gate.
+
+---
+
+## 16. Known issues / next steps
 
 - **No offline fallback for missing tiles**: if a PMTiles archive is unreachable,
   the decode fails with a generic error. A clear "tile not found" message would help.
@@ -397,10 +524,6 @@ guard for intermediate trace events where the interval might differ.
 - **TracePanel A\* table capped at 200 rows**: full A\* data is available in the JSON
   via "Copy JSON" but not browseable in the UI for large expansions.
 
-- **TracePanel not steppable**: the current UI shows the completed trace after decode.
-  The CLAUDE.md roadmap calls for an animated step-through (pause/resume) which would
-  require the WASM decode loop to become steppable.
-
 - **Popup position for trace highlights**: when a trace highlight hits multiple segments
   the popup is suppressed. For multi-segment path highlights a summary popup (total
   length, FRC range) would be useful.
@@ -409,3 +532,8 @@ guard for intermediate trace events where the interval might differ.
   in `RejectedTable` highlights the segment on the map. However, rejected candidates
   may be outside the loaded tile region (the tile wasn't fetched because the segment
   was beyond the search radius). In that case the highlight silently no-ops.
+
+- **Replay route geometry fallback**: the `replay-route` source uses the same two-step
+  segment geometry cache as the trace highlight. If a route segment ID is not in either
+  cache (e.g. the tile was not loaded), that segment is silently omitted from the gold
+  route line. The route will still show partially in most cases.

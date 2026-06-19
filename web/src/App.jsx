@@ -5,7 +5,8 @@ import TopBar from './components/TopBar.jsx';
 import ResultPanel from './components/ResultPanel.jsx';
 import ParamsPanel from './components/ParamsPanel.jsx';
 import TracePanel from './components/TracePanel.jsx';
-import { setPmtiles, setDecoder, setZoom } from './store.js';
+import ReplayPanel from './components/ReplayPanel.jsx';
+import { setPmtiles, setDecoder, setZoom, useStore } from './store.js';
 import { initWasm } from './wasm.js';
 
 export default function App() {
@@ -48,6 +49,7 @@ export default function App() {
     </div>
   );
 
+  const showReplay = useStore(s => s.showReplay);
   return (
     <div className="app">
       <MapView tilesBase={tilesBase} ready={ready} />
@@ -55,6 +57,7 @@ export default function App() {
       <ParamsPanel />
       <ResultPanel />
       <TracePanel />
+      {showReplay && <ReplayPanel />}
     </div>
   );
 }

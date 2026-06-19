@@ -302,6 +302,36 @@ html, body, #root, .app {
   background: rgba(255, 255, 255, 0.08);
 }
 
+/* ── Candidate popup extras ─────────────────────────────────────────────────── */
+
+/* Wider than the default seg-info-panel */
+.cand-panel { min-width: 320px; max-width: 360px; }
+
+.cand-table { width: 100%; table-layout: fixed; }
+.cand-table td { word-break: break-word; overflow-wrap: break-word; }
+.cand-table .seg-info-key { width: 88px; vertical-align: top; }
+
+.cand-winner-badge { font-size: 11px; color: #ffe066; margin-left: 6px; font-weight: 600; }
+.cand-accepted     { color: #00ff88; }
+.cand-rejected     { color: #ff8844; }
+.cand-verdict-detail {
+  font-size: 11px;
+  color: #cc8866;
+  padding-bottom: 4px;
+  white-space: normal;
+  word-break: break-word;
+}
+.cand-section {
+  padding-top: 8px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #556677;
+}
+.cand-lower       { font-weight: 400; text-transform: none; color: #445566; }
+.cand-score-total { color: #aad4ff; }
+
 /* ── FRC Legend ─────────────────────────────────────────────────────────────── */
 
 .frc-legend {
@@ -1098,4 +1128,171 @@ html, body, #root, .app {
 
 .tp-lrp-row:hover td {
   background: rgba(170, 0, 255, 0.08);
+}
+
+/* ── Replay button (TopBar) ──────────────────────────────────────────────────── */
+
+.replay-btn {
+  background: rgba(0, 200, 100, 0.15);
+  color: #00cc66;
+  border: 1px solid rgba(0, 200, 100, 0.35);
+  border-radius: 6px;
+  padding: 5px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: background 0.15s, color 0.15s;
+}
+.replay-btn:hover { background: rgba(0, 200, 100, 0.25); }
+.replay-btn.active {
+  background: rgba(0, 200, 100, 0.28);
+  color: #00ff88;
+  border-color: rgba(0, 200, 100, 0.6);
+  box-shadow: 0 0 8px rgba(0, 200, 100, 0.25);
+}
+
+/* ── Replay panel (bottom bar) ───────────────────────────────────────────────── */
+
+.replay-panel {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 20;
+  background: rgba(8, 8, 18, 0.94);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border-top: 1px solid rgba(255, 255, 255, 0.10);
+  padding: 8px 16px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.5);
+}
+
+.replay-panel-empty {
+  align-items: center;
+  justify-content: center;
+  padding: 10px 16px;
+}
+
+.replay-hint { color: #556677; font-size: 12px; }
+.replay-hint strong { color: #aabbcc; }
+
+/* Controls row */
+.replay-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.rp-btn {
+  background: rgba(255,255,255,0.07);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 5px;
+  color: #ccd0e0;
+  font-size: 15px;
+  width: 34px;
+  height: 30px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.12s;
+  user-select: none;
+}
+.rp-btn:hover:not(:disabled) { background: rgba(255,255,255,0.15); }
+.rp-btn:active:not(:disabled) { background: rgba(255,255,255,0.24); transform: scale(0.95); }
+.rp-btn:disabled { opacity: 0.3; cursor: default; }
+
+.rp-hint-bar {
+  font-size: 11px;
+  color: #88aacc;
+  background: rgba(0, 100, 200, 0.12);
+  border: 1px solid rgba(0, 150, 255, 0.2);
+  border-radius: 5px;
+  padding: 4px 10px;
+}
+.rp-hint-bar strong { color: #aad4ff; }
+
+.replay-counter {
+  font-size: 11px;
+  font-family: monospace;
+  color: #556677;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  white-space: nowrap;
+}
+.rp-step-num { color: #aabbcc; font-weight: 600; }
+.rp-step-sep { color: #445566; }
+.rp-step-tot { color: #778899; }
+.rp-astar-count { color: #446688; margin-left: 4px; }
+
+.replay-status {
+  flex: 1;
+  font-size: 11px;
+  font-family: monospace;
+  color: #88aacc;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* Timeline */
+.replay-timeline-wrap { position: relative; }
+
+.replay-timeline {
+  position: relative;
+  height: 12px;
+  background: rgba(255,255,255,0.06);
+  border-radius: 6px;
+  cursor: pointer;
+  overflow: hidden;
+  border: 1px solid rgba(255,255,255,0.08);
+}
+
+.rp-phase-strip {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  pointer-events: none;
+}
+
+.rp-progress {
+  position: absolute;
+  top: 0; left: 0;
+  height: 100%;
+  background: linear-gradient(90deg, #0055aa, #0088ff 60%, #00ccff);
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+.rp-handle {
+  position: absolute;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 13px; height: 13px;
+  background: #fff;
+  border-radius: 50%;
+  box-shadow: 0 0 6px rgba(0,180,255,0.9);
+  pointer-events: none;
+}
+
+.rp-phase-labels {
+  position: relative;
+  height: 13px;
+  margin-top: 2px;
+}
+
+.rp-phase-label {
+  position: absolute;
+  transform: translateX(-50%);
+  font-size: 9px;
+  font-family: monospace;
+  opacity: 0.75;
+  white-space: nowrap;
+  pointer-events: none;
 }

@@ -4,9 +4,9 @@ import { useStore } from '../store.js';
 const TRACE_LEVELS = ['Off', 'Summary', 'Full'];
 
 export default function TopBar() {
-  const { openlrString, showParams, showTrace, showSegmentLayer, decoding, params,
-          setOpenlrString, toggleParams, toggleTrace, toggleSegmentLayer,
-          setTraceLevel, resetToDefaults, runDecode } = useStore();
+  const { openlrString, showParams, showTrace, showSegmentLayer, showReplay, decoding, params,
+          setOpenlrString, toggleParams, toggleTrace, toggleSegmentLayer, toggleReplay,
+          setTraceLevel, resetToDefaults, runDecode, replaySteps } = useStore();
 
   const [showGear, setShowGear] = useState(false);
   const gearRef = useRef(null);
@@ -54,6 +54,17 @@ export default function TopBar() {
               </button>
             </div>
             <div className="gear-row">
+              <span>Replay</span>
+              <button
+                className={`gear-toggle${showReplay ? ' on' : ''}${!replaySteps?.length ? ' disabled' : ''}`}
+                onClick={toggleReplay}
+                disabled={!replaySteps?.length}
+                title={!replaySteps?.length ? 'Decode first to enable replay' : undefined}
+              >
+                {showReplay ? 'On' : 'Off'}
+              </button>
+            </div>
+            <div className="gear-row">
               <span>Trace level</span>
               <div className="gear-level-group">
                 {TRACE_LEVELS.map(lvl => (
@@ -75,6 +86,13 @@ export default function TopBar() {
           </div>
         )}
       </div>
+      {replaySteps?.length > 0 && (
+        <button
+          className={`replay-btn${showReplay ? ' active' : ''}`}
+          onClick={toggleReplay}
+          title="Toggle decode replay"
+        >▶ Replay</button>
+      )}
       <button className="decode-btn" onClick={runDecode} disabled={decoding}>
         {decoding ? '…' : 'Decode'}
       </button>

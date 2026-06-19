@@ -4,6 +4,7 @@ import 'maplibre-gl/dist/maplibre-gl.css';
 import { PMTiles } from 'pmtiles';
 import { useStore, getSegmentId, getSegGeomCache, getSegIdToTile, getTileGeomCache } from '../store.js';
 import { useDraggable } from '../hooks.js';
+import { emptyState, applyStep, computeVisualState, stateToGeoJSON } from '../replayEngine.js';
 
 
 function popupStyle(anchor, w = 260, h = 200) {
@@ -61,6 +62,7 @@ const CUSTOM_SOURCES = new Set([
   'olr-segments', 'decoded-path', 'lrp-markers',
   'lrp-snap', 'lrp-displacement',
   'offset-uncertainty', 'lrp-bearing', 'highlighted-segment', 'trace-segment',
+  'replay-radius', 'replay-route', 'replay-candidates', 'replay-cloud', 'replay-frontier', 'replay-leg', 'replay-flash',
 ]);
 const CUSTOM_LAYER_IDS = new Set([
   'olr-frc0','olr-frc1','olr-frc2','olr-frc3','olr-frc4','olr-frc5','olr-frc6','olr-frc7',
@@ -70,6 +72,13 @@ const CUSTOM_LAYER_IDS = new Set([
   'lrp-bearing-fill', 'lrp-bearing-outline',
   'highlighted-segment-halo', 'highlighted-segment-line',
   'trace-segment-halo', 'trace-segment-line',
+  'replay-radius-fill', 'replay-radius-line',
+  'replay-route-line',
+  'replay-candidates-circle',
+  'replay-cloud-circle',
+  'replay-frontier-circle',
+  'replay-leg-from', 'replay-leg-to',
+  'replay-flash-ring',
 ]);
 
 const FRC_COLOR = ['#e8002d', '#ff7700', '#e8c800', '#00aa44',
@@ -174,23 +183,34 @@ function addMapImages(map) {
 // ── Map Component ──────────────────────────────────────────────────────────────
 
 export default function MapView({ tilesBase, ready }) {
-  const mapContainer = useRef(null);
-  const mapRef = useRef(null);
-  const tileCacheRef = useRef(new Map());
+  const mapContainer    = useRef(null);
+  const mapRef          = useRef(null);
+  const tileCacheRef    = useRef(new Map());
   const pendingCountRef = useRef(0);
-  const pmtilesRef = useRef(null);
-  const pulseRef   = useRef(null);
-  const lrpPanelRef = useRef(null);
-  const segPanelRef = useRef(null);
+  const pmtilesRef      = useRef(null);
+  const pulseRef        = useRef(null);
+  const frontierPulseRef = useRef(null);
+  const lrpPanelRef     = useRef(null);
+  const segPanelRef     = useRef(null);
+  // Incremental replay state — avoids O(N²) recomputation when stepping forward
+  const replayVisualRef = useRef(null);   // last computed visual state
+  const replayStepRef   = useRef(-1);     // step index of replayVisualRef
+  const replayStepsKey  = useRef(null);   // identity check for replaySteps array
+  const flashAnimRef    = useRef(null);   // rAF handle for sonar-ping fade animation
+  const routePulseRef   = useRef(null);   // rAF handle for route-found pulse animation
+  const candPanelRef    = useRef(null);
 
   const [status, setStatus] = useState(null);
   const [infoProps, setInfoProps] = useState(null);
   const [infoAnchor, setInfoAnchor] = useState(null);
   const [lrpInfo, setLrpInfo] = useState(null);
+  const [candInfo, setCandInfo] = useState(null);
+  const [candAnchor, setCandAnchor] = useState(null);
   const [basemap, setBasemap] = useState('liberty');
 
-  const { pos: lrpPos, onMouseDown: lrpMouseDown, resetPos: lrpResetPos } = useDraggable(lrpPanelRef);
-  const { pos: segPos, onMouseDown: segMouseDown, resetPos: segResetPos } = useDraggable(segPanelRef);
+  const { pos: lrpPos,  onMouseDown: lrpMouseDown,  resetPos: lrpResetPos  } = useDraggable(lrpPanelRef);
+  const { pos: segPos,  onMouseDown: segMouseDown,  resetPos: segResetPos  } = useDraggable(segPanelRef);
+  const { pos: candPos, onMouseDown: candMouseDown, resetPos: candResetPos } = useDraggable(candPanelRef);
 
   const decodeResult          = useStore(s => s.decodeResult);
   const highlightedSegment    = useStore(s => s.highlightedSegment);
@@ -200,6 +220,10 @@ export default function MapView({ tilesBase, ready }) {
   const setTraceLrpFocus      = useStore(s => s.setTraceLrpFocus);
   const showSegmentLayer      = useStore(s => s.showSegmentLayer);
   const searchRadiusM         = useStore(s => s.params.candidate_search_radius_m);
+  const replayStep  = useStore(s => s.replayStep);
+  const replaySteps = useStore(s => s.replaySteps);
+  const replayStats = useStore(s => s.replayStats);
+  const showReplay  = useStore(s => s.showReplay);
 
   // Reset drag position when a new popup target is clicked
   useEffect(() => { lrpResetPos(); }, [lrpInfo]);   // eslint-disable-line react-hooks/exhaustive-deps
@@ -426,6 +450,113 @@ export default function MapView({ tilesBase, ready }) {
         },
       });
 
+      // ── Replay sources & layers ──────────────────────────────────────────
+      const emptyFC = { type: 'FeatureCollection', features: [] };
+
+      map.addSource('replay-radius',     { type: 'geojson', data: emptyFC });
+      map.addSource('replay-route',      { type: 'geojson', data: emptyFC });
+      map.addSource('replay-candidates', { type: 'geojson', data: emptyFC });
+      map.addSource('replay-cloud',      { type: 'geojson', data: emptyFC });
+      map.addSource('replay-frontier',   { type: 'geojson', data: emptyFC });
+      map.addSource('replay-leg',        { type: 'geojson', data: emptyFC });
+
+      // Search radius ring — pulsing fill + dashed border
+      map.addLayer({
+        id: 'replay-radius-fill', type: 'fill', source: 'replay-radius',
+        paint: { 'fill-color': '#aa44ff', 'fill-opacity': 0.06 },
+      });
+      map.addLayer({
+        id: 'replay-radius-line', type: 'line', source: 'replay-radius',
+        paint: { 'line-color': '#cc66ff', 'line-width': 2, 'line-opacity': 0.85, 'line-dasharray': [4, 3] },
+      });
+
+      // Found route — pulsing line, updated each time a route_found step fires
+      map.addLayer({
+        id: 'replay-route-line', type: 'line', source: 'replay-route',
+        paint: { 'line-color': '#ffe066', 'line-width': 4, 'line-opacity': 0.85, 'line-cap': 'round', 'line-join': 'round' },
+      });
+
+      // Candidate snap points — colour by verdict type
+      map.addLayer({
+        id: 'replay-candidates-circle', type: 'circle', source: 'replay-candidates',
+        paint: {
+          // Winners (chosen leg endpoints) are larger with a white ring.
+          'circle-radius': ['case',
+            ['boolean', ['get', 'winner'], false], 10,
+            ['==', ['get', 'ctype'], 'accepted'],   7,
+            5,
+          ],
+          'circle-opacity': 0.95,
+          'circle-stroke-width': ['case',
+            ['boolean', ['get', 'winner'], false], 3,
+            ['==', ['get', 'ctype'], 'accepted'],   2,
+            1,
+          ],
+          'circle-stroke-color': ['case',
+            ['boolean', ['get', 'winner'], false], '#ffffff',
+            'rgba(0,0,0,0.5)',
+          ],
+          'circle-color': ['match', ['get', 'ctype'],
+            'accepted',  '#00ff88',
+            'bearing',   '#ff8c00',
+            'radius',    '#ffdd00',
+            'score',     '#cc44ff',
+            'direction', '#556677',
+            /* default */ '#aaaaaa',
+          ],
+        },
+      });
+
+      // A* expansion cloud — pre-computed colour per node
+      map.addLayer({
+        id: 'replay-cloud-circle', type: 'circle', source: 'replay-cloud',
+        paint: {
+          'circle-radius':  3,
+          'circle-opacity': 0.7,
+          'circle-color':   ['get', 'color'],
+          'circle-stroke-width': 0,
+        },
+      });
+
+      // Frontier — bright white pulsing nodes
+      map.addLayer({
+        id: 'replay-frontier-circle', type: 'circle', source: 'replay-frontier',
+        paint: {
+          'circle-radius':       6,
+          'circle-color':        '#ffffff',
+          'circle-opacity':      0.95,
+          'circle-blur':         0.3,
+          'circle-stroke-width': 1.5,
+          'circle-stroke-color': '#88ccff',
+        },
+      });
+
+      // Leg from/to markers
+      map.addLayer({
+        id: 'replay-leg-from', type: 'circle', source: 'replay-leg',
+        filter: ['==', ['get', 'role'], 'from'],
+        paint: { 'circle-radius': 9, 'circle-color': '#00ff88', 'circle-stroke-width': 2, 'circle-stroke-color': '#fff' },
+      });
+      map.addLayer({
+        id: 'replay-leg-to', type: 'circle', source: 'replay-leg',
+        filter: ['==', ['get', 'role'], 'to'],
+        paint: { 'circle-radius': 9, 'circle-color': '#ff4444', 'circle-stroke-width': 2, 'circle-stroke-color': '#fff' },
+      });
+
+      // Sonar-ping ring — tracks the latest A* node; animated via RAF in the replay effect.
+      map.addSource('replay-flash', { type: 'geojson', data: emptyFC });
+      map.addLayer({
+        id: 'replay-flash-ring', type: 'circle', source: 'replay-flash',
+        paint: {
+          'circle-radius':         20,
+          'circle-color':          'transparent',
+          'circle-stroke-width':   2.5,
+          'circle-stroke-color':   '#00eeff',
+          'circle-stroke-opacity': 1.0,
+          'circle-opacity':        0,
+        },
+      });
+
       // ── Click handlers ────────────────────────────────────────────────────
       for (let frc = 0; frc < 8; frc++) {
         map.on('click', `olr-frc${frc}`, onSegmentClick);
@@ -436,6 +567,16 @@ export default function MapView({ tilesBase, ready }) {
       map.on('click', 'lrp-markers-circle', onLrpClick);
       map.on('mouseenter', 'lrp-markers-circle', () => map.getCanvas().style.cursor = 'pointer');
       map.on('mouseleave', 'lrp-markers-circle', () => map.getCanvas().style.cursor = '');
+
+      map.on('click', 'replay-candidates-circle', (e) => {
+        const props = e.features?.[0]?.properties;
+        if (!props) return;
+        setCandInfo(props);
+        setCandAnchor({ x: e.point.x, y: e.point.y });
+        e.stopPropagation?.();
+      });
+      map.on('mouseenter', 'replay-candidates-circle', () => map.getCanvas().style.cursor = 'pointer');
+      map.on('mouseleave', 'replay-candidates-circle', () => map.getCanvas().style.cursor = '');
 
       map.on('click', 'decoded-path-line', onDecodedPathClick);
       map.on('mouseenter', 'decoded-path-line', () => map.getCanvas().style.cursor = 'pointer');
@@ -450,7 +591,10 @@ export default function MapView({ tilesBase, ready }) {
     map.on('zoomend', () => loadVisibleTiles(map));
 
     return () => {
-      if (pulseRef.current) { cancelAnimationFrame(pulseRef.current); pulseRef.current = null; }
+      if (pulseRef.current)         { cancelAnimationFrame(pulseRef.current);         pulseRef.current         = null; }
+      if (frontierPulseRef.current) { cancelAnimationFrame(frontierPulseRef.current); frontierPulseRef.current = null; }
+      if (routePulseRef.current)    { cancelAnimationFrame(routePulseRef.current);    routePulseRef.current    = null; }
+      if (flashAnimRef.current)     { cancelAnimationFrame(flashAnimRef.current);     flashAnimRef.current     = null; }
       map.remove();
       mapRef.current = null;
     };
@@ -759,6 +903,203 @@ export default function MapView({ tilesBase, ready }) {
     src.setData(bearingConeGeoJSON(coneLon, coneLat, bearing_lb, bearing_ub, searchRadiusM ?? 100));
   }, [lrpInfo, searchRadiusM]);
 
+  // ── Replay visual effect ─────────────────────────────────────────────────────
+
+  const replayLayerIds = [
+    'replay-radius-fill', 'replay-radius-line',
+    'replay-candidates-circle',
+    'replay-cloud-circle',
+    'replay-frontier-circle',
+    'replay-leg-from', 'replay-leg-to',
+    'replay-flash-ring',
+  ];
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    if (frontierPulseRef.current) {
+      cancelAnimationFrame(frontierPulseRef.current);
+      frontierPulseRef.current = null;
+    }
+    if (flashAnimRef.current) {
+      cancelAnimationFrame(flashAnimRef.current);
+      flashAnimRef.current = null;
+    }
+    if (routePulseRef.current) {
+      cancelAnimationFrame(routePulseRef.current);
+      routePulseRef.current = null;
+    }
+
+    const emptyFC = { type: 'FeatureCollection', features: [] };
+    const replaySources = ['replay-radius', 'replay-route', 'replay-candidates', 'replay-cloud', 'replay-frontier', 'replay-leg', 'replay-flash'];
+    const vis = showReplay && replaySteps.length > 0 ? 'visible' : 'none';
+    replayLayerIds.forEach(id => { if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', vis); });
+
+    if (!showReplay || !replaySteps.length) {
+      replaySources.forEach(s => { map.getSource(s)?.setData(emptyFC); });
+      replayVisualRef.current = null;
+      replayStepRef.current   = -1;
+      replayStepsKey.current  = null;
+      return;
+    }
+
+    const maxG = replayStats?.maxG ?? 0;
+
+    // Reset incremental state when a new decode's steps arrive
+    if (replayStepsKey.current !== replaySteps) {
+      replayVisualRef.current = null;
+      replayStepRef.current   = -1;
+      replayStepsKey.current  = replaySteps;
+    }
+
+    // ── Incremental update ──────────────────────────────────────────────────
+    // Forward step: apply only the new step(s) onto the existing state (O(1)).
+    // Backward / jump: recompute from scratch (O(N)).
+    let visualState;
+    if (replayVisualRef.current && replayStep >= replayStepRef.current) {
+      // Clone once, then apply each new step in place
+      visualState = replayVisualRef.current;
+      for (let i = replayStepRef.current + 1; i <= replayStep; i++) {
+        applyStep(visualState, replaySteps[i], maxG);
+        visualState.stepIdx = i;
+      }
+    } else {
+      visualState = computeVisualState(replaySteps, replayStep, replayStats);
+    }
+    replayVisualRef.current = visualState;
+    replayStepRef.current   = replayStep;
+
+    // ── Push GeoJSON to sources ─────────────────────────────────────────────
+    const gj = stateToGeoJSON(visualState);
+    map.getSource('replay-radius')     ?.setData(gj.radiusFC);
+    map.getSource('replay-candidates') ?.setData(gj.candFC);
+    map.getSource('replay-cloud')      ?.setData(gj.cloudFC);
+    map.getSource('replay-frontier')   ?.setData(gj.frontierFC);
+    map.getSource('replay-leg')        ?.setData(gj.legFC);
+
+    // Route segments — same two-step lookup as the trace-highlight effect
+    const segCache   = getSegGeomCache();
+    const segToTile  = getSegIdToTile();
+    const tileCache  = getTileGeomCache();
+    const routeFeats = (visualState.routeSegIds ?? []).map(id => {
+      let f = segCache.get(id);
+      if (!f) {
+        const m = segToTile.get(id);
+        if (m) f = tileCache.get(m.tile_key)?.find(x => x.properties.local_index === m.local_index);
+      }
+      return f;
+    }).filter(Boolean);
+    map.getSource('replay-route')?.setData({ type: 'FeatureCollection', features: routeFeats });
+
+    // ── Frontier pulse animation ────────────────────────────────────────────
+    if (gj.frontierFC.features.length > 0 && map.getLayer('replay-frontier-circle')) {
+      const t0 = performance.now();
+      const pulse = (now) => {
+        if (!map.getLayer('replay-frontier-circle')) return;
+        const phase = ((now - t0) / 600) * Math.PI * 2;
+        try {
+          map.setPaintProperty('replay-frontier-circle', 'circle-opacity', 0.6 + 0.4 * Math.sin(phase));
+          map.setPaintProperty('replay-frontier-circle', 'circle-radius',  5   + 2   * Math.sin(phase));
+        } catch (_) { return; }
+        frontierPulseRef.current = requestAnimationFrame(pulse);
+      };
+      frontierPulseRef.current = requestAnimationFrame(pulse);
+    }
+
+    // ── Auto-pan ────────────────────────────────────────────────────────────
+    const currentStep = replaySteps[replayStep];
+
+    if (currentStep?.type === 'search_started') {
+      map.flyTo({
+        center:   [currentStep.coord[0], currentStep.coord[1]],
+        zoom:     Math.max(map.getZoom(), 15),
+        duration: 400,
+      });
+    }
+
+    if (currentStep?.type === 'route_search_started') {
+      const from = currentStep.from.projection.point;
+      const to   = currentStep.to.projection.point;
+      map.fitBounds(
+        [[Math.min(from[0], to[0]), Math.min(from[1], to[1])],
+         [Math.max(from[0], to[0]), Math.max(from[1], to[1])]],
+        { padding: 120, maxZoom: 17, duration: 400 },
+      );
+    }
+
+    // When a leg route is found: pan to full route extent, then pulse the line for 3 s.
+    if (currentStep?.type === 'route_found') {
+      if (routeFeats.length > 0) {
+        let minLon = Infinity, minLat = Infinity, maxLon = -Infinity, maxLat = -Infinity;
+        for (const feat of routeFeats) {
+          const coords = feat.geometry.type === 'LineString'      ? feat.geometry.coordinates
+                       : feat.geometry.type === 'MultiLineString' ? feat.geometry.coordinates.flat()
+                       : [];
+          for (const [lon, lat] of coords) {
+            if (lon < minLon) minLon = lon; if (lon > maxLon) maxLon = lon;
+            if (lat < minLat) minLat = lat; if (lat > maxLat) maxLat = lat;
+          }
+        }
+        if (isFinite(minLon)) {
+          map.fitBounds([[minLon, minLat], [maxLon, maxLat]], { padding: 80, maxZoom: 17, duration: 600 });
+        }
+      }
+      if (routePulseRef.current) cancelAnimationFrame(routePulseRef.current);
+      const rt0 = performance.now();
+      const ROUTE_PULSE_MS = 3000;
+      const animRoute = (now) => {
+        if (!map.getLayer('replay-route-line')) return;
+        const elapsed = now - rt0;
+        const done    = elapsed >= ROUTE_PULSE_MS;
+        const phase   = (elapsed / 500) * Math.PI;
+        try {
+          map.setPaintProperty('replay-route-line', 'line-width',   done ? 4 : 3 + 3 * Math.abs(Math.sin(phase)));
+          map.setPaintProperty('replay-route-line', 'line-opacity', done ? 0.85 : 0.6 + 0.4 * Math.abs(Math.sin(phase)));
+        } catch (_) { return; }
+        if (!done) routePulseRef.current = requestAnimationFrame(animRoute);
+        else routePulseRef.current = null;
+      };
+      routePulseRef.current = requestAnimationFrame(animRoute);
+    }
+
+    // Follow each A* node: instant jump so playback stays in sync.
+    // Zoom 17 ≈ 700 m viewport width on a 1200 px screen — a typical road
+    // segment (100–300 m) fills roughly half the map.
+    if (currentStep?.type === 'astar_batch') {
+      const last = currentStep.nodes[currentStep.nodes.length - 1];
+      map.jumpTo({ center: [last.lon, last.lat], zoom: 17 });
+
+      // Sonar-ping: expanding cyan ring that fades out over 2 s.
+      // During rapid auto-play the ring stays bright (reset every 30 ms);
+      // it fades only when stepping pauses.
+      const flashSrc = map.getSource('replay-flash');
+      if (flashSrc && map.getLayer('replay-flash-ring')) {
+        flashSrc.setData({
+          type: 'FeatureCollection',
+          features: [{ type: 'Feature', geometry: { type: 'Point', coordinates: [last.lon, last.lat] }, properties: {} }],
+        });
+        if (flashAnimRef.current) cancelAnimationFrame(flashAnimRef.current);
+        const t0 = performance.now();
+        const FLASH_MS = 2000;
+        const animFlash = (now) => {
+          if (!map.getLayer('replay-flash-ring')) return;
+          const p = Math.min(1, (now - t0) / FLASH_MS);
+          try {
+            map.setPaintProperty('replay-flash-ring', 'circle-stroke-opacity', 1 - p);
+            map.setPaintProperty('replay-flash-ring', 'circle-radius', 20 + 18 * p);
+          } catch (_) { return; }
+          if (p < 1) {
+            flashAnimRef.current = requestAnimationFrame(animFlash);
+          } else {
+            flashSrc.setData({ type: 'FeatureCollection', features: [] });
+          }
+        };
+        flashAnimRef.current = requestAnimationFrame(animFlash);
+      }
+    }
+  }, [showReplay, replayStep, replaySteps, replayStats]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── Segment layer visibility toggle ──────────────────────────────────────────
 
   useEffect(() => {
@@ -979,6 +1320,23 @@ export default function MapView({ tilesBase, ready }) {
         </div>
       )}
 
+      {/* Candidate info popup */}
+      {candInfo && (
+        <div ref={candPanelRef} className="seg-info-panel cand-panel"
+          style={candPos ? { position: 'absolute', left: candPos.left, top: candPos.top, right: 'auto', bottom: 'auto' } : popupStyle(candAnchor, 320, 320)}>
+          <header className="seg-info-header" onMouseDown={candMouseDown}>
+            <span>
+              LRP {candInfo.lrp_idx} candidate
+              {candInfo.winner && <span className="cand-winner-badge"> ★ chosen</span>}
+            </span>
+            <button className="seg-info-close" onClick={() => { setCandInfo(null); setCandAnchor(null); candResetPos(); }}>✕</button>
+          </header>
+          <div className="seg-info-body">
+            <CandidatePopupBody p={candInfo} />
+          </div>
+        </div>
+      )}
+
       {/* FRC Legend — only shown when the Segs overlay is active */}
       {showSegmentLayer && (
         <div className="frc-legend">
@@ -1001,5 +1359,87 @@ export default function MapView({ tilesBase, ready }) {
         </select>
       </div>
     </div>
+  );
+}
+
+// ── Candidate popup body ───────────────────────────────────────────────────────
+
+function fmt(v, decimals = 2) {
+  if (v == null) return '—';
+  return typeof v === 'number' ? v.toFixed(decimals) : String(v);
+}
+
+/** Human-readable one-liner for a GateVerdict (serde externally-tagged). */
+function formatVerdict(json) {
+  if (!json) return null;
+  let v;
+  try { v = JSON.parse(json); } catch (_) { return null; }
+  if (!v || v === 'Pass') return null;
+  if (typeof v === 'string') return v;
+  const key = Object.keys(v)[0];
+  const val = v[key];
+  switch (key) {
+    case 'FailBearing':
+      return `Bearing gate — exceeded by ${(val?.excess_deg ?? 0).toFixed(1)}°`;
+    case 'FailRadius':
+      return `Outside search radius`;
+    case 'FailScore':
+      return `Score too high${val?.score != null ? ` (${val.score.toFixed(4)})` : ''}`;
+    case 'FailDirection':
+      return `Wrong direction (one-way)`;
+    default:
+      return `${key}${typeof val === 'object' ? ': ' + JSON.stringify(val) : ''}`;
+  }
+}
+
+const RESULT_LABEL = {
+  accepted:  'Accepted',
+  bearing:   'Bearing gate failed',
+  radius:    'Outside search radius',
+  score:     'Score gate failed',
+  direction: 'Wrong direction',
+  other:     'Rejected',
+};
+
+function CandidatePopupBody({ p }) {
+  const accepted     = p.ctype === 'accepted';
+  const resultLabel  = RESULT_LABEL[p.ctype] ?? p.ctype;
+  const verdictLine  = !accepted ? formatVerdict(p.verdict_json) : null;
+
+  return (
+    <table className="cand-table">
+      <tbody>
+        <tr>
+          <td className="seg-info-key">Result</td>
+          <td><b className={accepted ? 'cand-accepted' : 'cand-rejected'}>{resultLabel}</b></td>
+        </tr>
+        {verdictLine &&
+          <tr><td className="seg-info-key"></td><td className="cand-verdict-detail">{verdictLine}</td></tr>}
+        {p.segment_id != null &&
+          <tr><td className="seg-info-key">Seg ID</td><td><b>{p.segment_id}</b></td></tr>}
+        {p.traversal &&
+          <tr><td className="seg-info-key">Traversal</td><td><b>{p.traversal}</b></td></tr>}
+
+        {/* Projection */}
+        <tr><td colSpan={2} className="cand-section">Projection</td></tr>
+        <tr><td className="seg-info-key">Dist from LRP</td><td><b>{fmt(p.distance_m)} m</b></td></tr>
+        {p.arc_offset_m != null &&
+          <tr><td className="seg-info-key">Arc offset</td><td><b>{fmt(p.arc_offset_m)} m</b></td></tr>}
+        {p.bearing_deg != null &&
+          <tr><td className="seg-info-key">Bearing</td><td><b>{fmt(p.bearing_deg, 1)}°</b></td></tr>}
+
+        {/* Score breakdown — accepted only */}
+        {accepted && <>
+          <tr><td colSpan={2} className="cand-section">Score <span className="cand-lower">(lower = better)</span></td></tr>
+          <tr><td className="seg-info-key">Total</td>     <td><b className="cand-score-total">{fmt(p.score_total, 4)}</b></td></tr>
+          <tr><td className="seg-info-key">Distance</td>  <td><b>{fmt(p.score_distance, 4)}</b></td></tr>
+          <tr><td className="seg-info-key">Bearing</td>   <td><b>{fmt(p.score_bearing, 4)}</b></td></tr>
+          <tr><td className="seg-info-key">FRC</td>       <td><b>{fmt(p.score_frc, 4)}</b></td></tr>
+          <tr><td className="seg-info-key">FOW</td>       <td><b>{fmt(p.score_fow, 4)}</b></td></tr>
+          <tr><td className="seg-info-key">Wrong EP</td>  <td><b>{fmt(p.score_wrong_ep, 4)}</b></td></tr>
+          <tr><td className="seg-info-key">Interior</td>  <td><b>{fmt(p.score_interior, 4)}</b></td></tr>
+        </>}
+      </tbody>
+    </table>
   );
 }

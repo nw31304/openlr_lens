@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { decodeTile } from './tileDecoder.js';
+import { buildReplaySteps } from './replayEngine.js';
 
 let _pmtiles = null;
 let _decoder = null;
@@ -117,11 +118,16 @@ export const useStore = create(persist(
   showParams: false,
   showTrace: false,
   showSegmentLayer: false,
+  showReplay: false,
   decoding: false,
   decodeResult: null,
   highlightedSegment: null,
   traceHighlightSegIds: null,
   traceLrpFocus: null,
+  // ── Replay state ─────────────────────────────────────────────────────────
+  replaySteps: [],        // pre-built display steps from buildReplaySteps()
+  replayStats: null,      // { maxG, totalNodes, phases }
+  replayStep: 0,          // current display step index
 
   setOpenlrString: (s) => set({ openlrString: s }),
 
@@ -144,6 +150,12 @@ export const useStore = create(persist(
   toggleParams:        () => set(state => ({ showParams:        !state.showParams })),
   toggleTrace:         () => set(state => ({ showTrace:         !state.showTrace })),
   toggleSegmentLayer:  () => set(state => ({ showSegmentLayer:  !state.showSegmentLayer })),
+  toggleReplay:        () => set(state => ({ showReplay:        !state.showReplay })),
+
+  setReplayStep:  (n)  => set(state => ({ replayStep: Math.max(0, Math.min(n, state.replaySteps.length - 1)) })),
+  stepReplay: (delta) => set(state => ({
+    replayStep: Math.max(0, Math.min(state.replayStep + delta, state.replaySteps.length - 1)),
+  })),
 
   clearResult: () => set({ decodeResult: null, highlightedSegment: null, traceHighlightSegIds: null, traceLrpFocus: null }),
   setHighlightedSegment: (seg) => set({ highlightedSegment: seg }),
@@ -221,7 +233,17 @@ export const useStore = create(persist(
         const routes = result.trace.events.filter(e => e.RouteSearchStarted || e.DnpChecked);
         console.log('[TRACE] Routing events:', JSON.stringify(routes, null, 2));
       }
-      set({ decoding: false, decodeResult: result });
+      // Build replay steps from trace events (if any)
+      const replayData = result.trace?.events?.length
+        ? buildReplaySteps(result.trace.events)
+        : { steps: [], stats: null };
+      set({
+        decoding: false,
+        decodeResult: result,
+        replaySteps: replayData.steps,
+        replayStats:  replayData.stats,
+        replayStep:   0,
+      });
     } catch (e) {
       set({ decoding: false, decodeResult: { ok: false, error: e.message, segments: [] } });
     }

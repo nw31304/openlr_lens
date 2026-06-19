@@ -76,12 +76,15 @@ pub fn find_route(
 
     // Trivial case: adjacent segments already share the junction node.
     if start_node == goal_node {
+        let (sn_lon, sn_lat) = graph.nodes.get(&start_node).map(|n| (n.lon, n.lat)).unwrap_or((0.0, 0.0));
         trace.push_full(Ev::AStarNodeExpanded {
             leg,
             node_id: start_node,
             via_segment: from.segment_id,
             g_m: 0.0,
             h_m: 0.0,
+            lon: sn_lon,
+            lat: sn_lat,
         });
         return Ok(RouteResult { segments: vec![], length_m: 0.0 });
     }
@@ -122,12 +125,16 @@ pub fn find_route(
         closed_list.push(ClosedEntry { node, via_seg, g, parent: parent_idx });
         closed.insert(state, entry_idx);
 
+        let (node_lon, node_lat) = graph.nodes.get(&node).map(|n| (n.lon, n.lat)).unwrap_or((0.0, 0.0));
+        let node_h = graph.node_dist_m(node, goal_lon, goal_lat).unwrap_or(0.0);
         trace.push_full(Ev::AStarNodeExpanded {
             leg,
             node_id: node,
             via_segment: via_seg,
             g_m: g,
-            h_m: graph.node_dist_m(node, goal_lon, goal_lat).unwrap_or(0.0),
+            h_m: node_h,
+            lon: node_lon,
+            lat: node_lat,
         });
 
         // Goal check: reached to.entry_node via a segment other than the start segment.

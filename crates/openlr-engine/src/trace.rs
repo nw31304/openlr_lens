@@ -169,6 +169,9 @@ pub enum DecodeEvent {
         via_segment: SegmentId,
         g_m: f64,
         h_m: f64,
+        /// WGS84 coordinates of this node — needed for map visualization in the replay UI.
+        lon: f64,
+        lat: f64,
     },
     /// Emitted for every edge the A* skips (Full only).
     AStarEdgeSkipped {
