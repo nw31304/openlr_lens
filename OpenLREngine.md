@@ -408,7 +408,7 @@ skipped.
 | `frc_weight` | 0.10 | Weight applied to FRC table lookup |
 | `fow_weight` | 0.20 | Weight applied to FOW table lookup |
 | `interior_weight` | 0.10 | Penalty when LRP is not at an endpoint |
-| `wrong_endpoint_weight` | 0.20 | Scales 0→1 based on position along segment |
+| `wrong_endpoint_weight` | 0.20 (Rust default); **5.0 in the UI Default preset** | Scales 0→1 based on position along segment. The UI Default preset uses a much higher value to strongly discourage mid-segment endpoints; the parameter has no upper cap in the UI |
 
 ### Penalty tables
 | Parameter | Default | Role |
@@ -552,7 +552,8 @@ candidates for an LRP were rejected.
   references with many LRPs and many candidates, the first winning combination may
   not be the globally optimal one. This is acceptable for v1.
 
-- **WASM steppability** — the decode loop is not yet steppable (pause/resume for UI
-  animation). The architecture is already structured for this (trace events are
-  emitted in order) but the `decode()` function is synchronous and blocking. The
-  WASM wrapper will need to split it into steps.
+- **WASM steppability** — the decode loop is not steppable (pause/resume mid-decode).
+  The `decode()` function is synchronous and blocking. The step-by-step visualisation
+  is implemented post-hoc: `buildReplaySteps()` in `replayEngine.js` converts the
+  completed `DecodeTrace.events` array into display steps that the UI replays. This
+  achieves the visual goal without requiring true mid-decode suspension.

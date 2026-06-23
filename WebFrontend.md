@@ -55,14 +55,21 @@ Uses **Zustand**. All shared UI state lives here.
 | `showTrace` | bool | TracePanel visible |
 | `showSegmentLayer` | bool | OLR segment FRC layer visible |
 | `showReplay` | bool | ReplayPanel visible |
+| `showLlmSettings` | bool | LLM settings panel visible |
 | `decoding` | bool | Decode in progress |
 | `decodeResult` | object \| null | Last decode result from WASM |
 | `highlightedSegment` | `{tile, local_index}` \| null | Segment highlighted from ResultPanel |
+| `requestedInfoSegment` | `{tile, local_index}` \| null | Segment for which popup info was explicitly requested (ResultPanel row click) |
 | `traceHighlightSegIds` | `number[]` \| null | Segment IDs to highlight from TracePanel |
 | `traceLrpFocus` | `{lon, lat, index, …, _tick}` \| null | LRP to pan to (with `_tick` to allow re-click) |
+| `candidatePopup` | object \| null | Data for the candidate evaluation popup opened from the TracePanel (see §10) |
 | `replaySteps` | `Step[]` | Pre-built display steps from `buildReplaySteps()` |
 | `replayStats` | `{maxG, totalNodes, phases}` \| null | Summary stats for the replay (used for colour normalisation and timeline phases) |
 | `replayStep` | number | Current display step index (0-based) |
+| `llmConfig` | object \| null | LLM provider config `{provider, apiKey, model}`; persisted to localStorage |
+| `llmChatOpen` | bool | LLM chat panel visible |
+| `llmMessages` | `{role, content, error?}[]` | LLM chat message history for the current session |
+| `llmLoading` | bool | LLM request currently in flight |
 
 ### Zustand `persist` and the `merge` function
 
@@ -138,12 +145,11 @@ GeoJSON sources added on the `map.on('load')` callback, split into permanent and
 | Source | Layer(s) | Purpose |
 |---|---|---|
 | `olr-segments` | `olr-frc0` … `olr-frc7`, `olr-highlight` | All road segments, FRC-coloured; toggled by Segs button |
-| `decoded-path` | `decoded-path-line` | Solid decoded path (cyan), trimmed at `pos_offset_ub` / `neg_offset_ub` |
-| `decoded-path-uncertainty-pos` | `decoded-path-uncertainty-pos-line` | Dashed cyan uncertainty cap at path start |
-| `decoded-path-uncertainty-neg` | `decoded-path-uncertainty-neg-line` | Dashed cyan uncertainty cap at path end |
+| `decoded-path` | `decoded-path-line`, `decoded-path-arrow` | Solid decoded path (cyan) with dense dark-navy direction triangles (SDF, 18px spacing, white halo) |
+| `offset-uncertainty` | `offset-uncertainty-line` | Dashed darker-cyan line for v3 offset uncertainty zones at path head/tail |
 | `lrp-markers` | `lrp-markers-circle` | LRP point markers (purple circles) |
 | `highlighted-segment` | `highlighted-segment-halo`, `highlighted-segment-line` | Segment highlighted from ResultPanel or TracePanel; animated pulse halo |
-| `trace-segment` | `trace-segment-halo`, `trace-segment-line` | Orange highlight driven by TracePanel segment buttons |
+| `trace-segment` | `trace-segment-halo`, `trace-segment-line`, `trace-segment-arrow` | Highlight driven by TracePanel segment buttons. When a candidate popup is active: line colour = green (accepted) or red (rejected); arrow layer becomes visible with matching colour + white halo; coordinates reversed for Backward traversal |
 
 **Replay sources** (all toggled via `visibility` when `showReplay` changes):
 
@@ -151,7 +157,7 @@ GeoJSON sources added on the `map.on('load')` callback, split into permanent and
 |---|---|---|
 | `replay-radius` | `replay-radius-fill`, `replay-radius-line` | LRP candidate search radius ring (dashed purple) |
 | `replay-route` | `replay-route-line` | Found leg route (gold line); pulsed for 3 s when `route_found` fires |
-| `replay-candidates` | `replay-candidates-circle` | Candidate snap points, coloured by gate result (see §15) |
+| `replay-candidates` | `replay-candidates-line`, `replay-candidates-arrow` | Candidate segments as coloured LineStrings (green = accepted, red = rejected, bright green = winner) with direction triangles. Coordinates reversed for Backward traversal so arrows point the correct way. See §15 for colour key |
 | `replay-cloud` | `replay-cloud-circle` | A* expanded-node cloud; colour by `g_m/maxG` ramp (blue→yellow→red) |
 | `replay-frontier` | `replay-frontier-circle` | Latest `FRONTIER_SIZE=25` A* nodes; sinusoidal pulse animation |
 | `replay-leg` | `replay-leg-from`, `replay-leg-to` | Green (from) / red (to) leg endpoint markers |
@@ -189,7 +195,7 @@ becomes visible once `showSegmentLayer` is true and `zoom ≥ MIN_LOAD_ZOOM (10)
 
 ### Highlight sync effects
 
-Three React effects in `Map.jsx` react to Zustand state:
+Key React effects in `Map.jsx` that react to Zustand state:
 
 1. **`[highlightedSegment, traceHighlightSegIds]`**: updates `highlighted-segment`
    source. Reads decode result via `decodeResultRef` (a ref, not a dependency) to
@@ -198,15 +204,25 @@ Three React effects in `Map.jsx` react to Zustand state:
 
 2. **`[traceHighlightSegIds]`**: updates `trace-segment` source using the three
    module-level caches. Primary path: `segGeomCache.get(segId)`. Fallback: two-step
-   lookup via `segIdToTile` + `tileGeomCache`. If a single segment is highlighted,
-   also shows a segment info popup.
+   lookup via `segIdToTile` + `tileGeomCache`. When a candidate popup is active and its
+   traversal is `Backward`, reverses the feature coordinates before setting the source
+   so `trace-segment-arrow` chevrons point in the traversal direction. Suppresses the
+   segment info popup when a candidate popup is already being shown.
 
-3. **`[traceLrpFocus]`**: calls `map.flyTo()` to pan to the LRP and shows the LRP
+3. **`[candidatePopup]`**: updates `candidatePopupRef.current` (a ref used inside
+   effect 2 without adding it as a dependency). Calls `map.setPaintProperty` on
+   `trace-segment-line` (green/red colour) and toggles `trace-segment-arrow` visibility.
+   Applies a MapLibre filter to `replay-candidates-arrow` restricting arrows to the
+   selected candidate's `segment_id` + `traversal`, preventing overlapping
+   opposite-direction arrows when both traversals of a bidirectional segment are in the
+   candidate list. Clears the filter when the popup closes.
+
+4. **`[traceLrpFocus]`**: calls `map.flyTo()` to pan to the LRP and shows the LRP
    info popup. Clears `traceLrpFocus` after acting so the same LRP can be clicked again.
 
-4. **`[showSegmentLayer]`**: toggles visibility of `olr-frc*` and `olr-highlight` layers.
+5. **`[showSegmentLayer]`**: toggles visibility of `olr-frc*` and `olr-highlight` layers.
 
-5. **`[decodeResult]`**: populates `decoded-path` and `lrp-markers` sources; calls
+6. **`[decodeResult]`**: populates `decoded-path` and `lrp-markers` sources; calls
    `map.fitBounds()` (deferred one frame via `requestAnimationFrame` to allow `setData`
    to process first).
 
@@ -330,10 +346,42 @@ Partitions the flat event list into:
 
 ### `SegBtn`
 
-Clickable badge that calls `setTraceHighlight([segId])`. The `e.stopPropagation()`
-call is required to prevent the section collapse from intercepting the click.
-`setTraceHighlight` in the store sets `traceHighlightSegIds`, which triggers the
-trace highlight effect in `Map.jsx`.
+Clickable badge that calls `setTraceHighlight([segId])`, then optionally calls an
+`onSelect` callback. The `e.stopPropagation()` call is required to prevent the section
+collapse from intercepting the click. `setTraceHighlight` in the store sets
+`traceHighlightSegIds`, which triggers the trace highlight effect in `Map.jsx`.
+
+### Candidate evaluation popup (`candidatePopup` store state)
+
+Clicking a candidate row (accepted or rejected) in the TracePanel calls both
+`setTraceHighlight([segId])` and `setCandidatePopup(buildCandPopup(...))`. The popup
+is a draggable overlay (`cand-panel` CSS class) anchored at the candidate snap point.
+
+`buildCandPopup(segId, lrpIdx, traversal, ctype, winner, snapPt, projection, score, verdict)`
+constructs the popup data object from the trace event fields plus geometry-cache lookups:
+
+| Field | Source |
+|---|---|
+| `segment_id`, `source_id` | engine ID + `segGeomCache` properties |
+| `traversal` | `'Forward'` \| `'Backward'` |
+| `ctype` | `'accepted'` \| `'bearing'` \| `'radius'` \| `'score'` \| `'direction'` |
+| `winner` | true for the chosen leg endpoint |
+| `snap_lon`, `snap_lat` | projection snap point (used to anchor the popup on the map) |
+| `distance_m`, `arc_offset_m`, `bearing_deg` | from `projection` |
+| `score_total`, `score_distance`, `score_bearing`, `score_frc`, `score_fow`, `score_wrong_ep`, `score_interior` | from `score` |
+| `frc`, `fow`, `frc_name`, `fow_name`, `direction`, `length_m` | from `segGeomCache` feature properties |
+
+The popup body (`CandidatePopupBody`) shows three sections:
+- **Result**: Accepted / Rejected with ★ badge for winners
+- **Segment**: Key, Traversal, FRC N (name), FOW N (name), Direction, Length
+- **Projection**: Dist from LRP, Arc offset, Bearing
+- **Score**: all 7 components (lower = better); only for accepted candidates
+- **Gate failure**: human-readable reason; only for rejected candidates
+
+`clearCandidatePopup()` is called on new decodes and when the popup is closed. The
+`candidatePopupRef` (a `useRef`) mirrors the store state so that the
+`traceHighlightSegIds` effect can read traversal info without adding `candidatePopup`
+as a dependency and causing unwanted re-runs.
 
 ### Direct-match detection
 
@@ -417,20 +465,29 @@ The trace engine emits events; the replay engine converts them into *display ste
 
 **Candidate `winner` flag**: set to `true` on `route_search_started` for the candidates whose `segment_id` matches `step.from.segment_id` or `step.to.segment_id`. Winners render with a white ring and larger radius in the `replay-candidates-circle` layer.
 
-**`stateToGeoJSON(state)`** converts visual state to `{ radiusFC, candFC, cloudFC, frontierFC, legFC }`. Route geometry (`replay-route`) is built separately in `Map.jsx` using `getSegGeomCache()` / `getSegIdToTile()` / `getTileGeomCache()` (the same two-step fallback as the trace highlight effect).
+**`stateToGeoJSON(state, geomLookup)`** converts visual state to `{ radiusFC, candFC, cloudFC, frontierFC, legFC }`. The `geomLookup` parameter is `(segmentId) => GeoJSON Feature | undefined` — passed as `id => getSegGeomCache().get(id)` from `Map.jsx`. It is used to attach segment geometry and attributes (FRC, FOW, direction, length) to candidate features. Route geometry (`replay-route`) is built separately in `Map.jsx` using the same two-step geometry fallback.
 
-### Candidate GeoJSON properties
+**`verdictType(verdict)`** maps a `GateVerdict` object to a `ctype` string (`'accepted'`, `'bearing'`, `'radius'`, `'score'`, `'direction'`). It is exported so `TracePanel.jsx` can compute `ctype` values without duplicating the mapping.
 
-All candidate detail is flattened into GeoJSON feature properties so the click popup can read them without additional lookups:
+### Candidate GeoJSON features
+
+Candidates are **LineString** features (not Points). For each candidate in visual state:
+1. Look up segment geometry via `geomLookup(c.segmentId)`
+2. If `c.traversal === 'Backward'`, reverse the coordinate array so direction arrows point correctly
+3. Merge geometry + segment attributes into the feature properties
+
+All candidate detail is flattened into GeoJSON feature properties:
 
 | Property | Accepted | Rejected |
 |---|---|---|
 | `ctype` | `'accepted'` | `'bearing'` / `'radius'` / `'score'` / `'direction'` / `'other'` |
 | `winner` | true if chosen as leg endpoint | false |
-| `segment_id`, `traversal` | ✓ | if available |
+| `segment_id`, `traversal` | ✓ | ✓ (carried at Summary trace level) |
+| `snap_lon`, `snap_lat` | ✓ | ✓ |
 | `distance_m`, `arc_offset_m`, `bearing_deg` | ✓ | bearing/distance if available |
 | `score_total`, `score_distance`, `score_bearing`, `score_frc`, `score_fow`, `score_wrong_ep`, `score_interior` | ✓ | — |
 | `verdict_json` | — | JSON-stringified `GateVerdict` |
+| `frc`, `fow`, `frc_name`, `fow_name`, `direction`, `length_m`, `source_id` | from geom cache | from geom cache |
 
 ### `ReplayPanel.jsx`
 
@@ -480,17 +537,23 @@ This avoids the O(N²) cost of recomputing from step 0 on every step during forw
 |---|---|
 | `src/main.jsx` | React root mount; `<StrictMode>` wrapper |
 | `src/App.jsx` | Startup, WASM init, tile base URL, component tree |
-| `src/App.css` | All styles (TopBar, panels, map overlays, trace panel, replay panel) |
-| `src/store.js` | Zustand store; 3 module-level caches; `runDecode()`; PRESETS; replay state |
-| `src/replayEngine.js` | `buildReplaySteps`, `applyStep`, `emptyState`, `computeVisualState`, `stateToGeoJSON` |
+| `src/App.css` | All styles (TopBar, panels, map overlays, trace panel, replay panel, LLM chat) |
+| `src/store.js` | Zustand store; 3 module-level caches; `runDecode()`; PRESETS; replay + LLM state |
+| `src/replayEngine.js` | `buildReplaySteps`, `applyStep`, `emptyState`, `computeVisualState`, `stateToGeoJSON(state, geomLookup)`, `verdictType` |
 | `src/tileDecoder.js` | OLRL v2 binary → GeoJSON |
 | `src/wasm.js` | WASM module loader (`initWasm()`) |
 | `src/hooks.js` | `useDraggable` |
-| `src/components/Map.jsx` | MapLibre GL JS; all sources/layers; tile loader; highlight + replay effects |
+| `src/diagnosis.js` | `diagnoseFailure`, `diagnoseSuccess` — rule-based decode diagnosis from trace events |
+| `src/llmClient.js` | `chatComplete(config, messages)` — OpenAI-compatible HTTP client |
+| `src/llmDiagnosis.js` | `buildSystemContext(decodeResult, params)` — system prompt from decode state |
+| `src/renderLlmText.jsx` | Lightweight LLM markdown renderer (bold, code, lists) |
+| `src/llm/SYSTEM_PROMPT.md` | System prompt template for LLM chat sessions |
+| `src/llm/README.md` | LLM integration documentation |
+| `src/components/Map.jsx` | MapLibre GL JS; all sources/layers; tile loader; highlight + replay + candidatePopup effects |
 | `src/components/TopBar.jsx` | Input bar, gear menu, Trace level, ▶ Replay button, Decode button |
-| `src/components/ParamsPanel.jsx` | DecodeParams editor; FRC/FOW penalty tables |
-| `src/components/ResultPanel.jsx` | Decoded segment list; click-to-highlight |
-| `src/components/TracePanel.jsx` | Full decode trace view |
+| `src/components/ParamsPanel.jsx` | DecodeParams editor; FRC/FOW penalty tables; `SpinInput` with optional max |
+| `src/components/ResultPanel.jsx` | Decoded segment list; click-to-highlight; failure diagnosis; LLM chat button |
+| `src/components/TracePanel.jsx` | Full decode trace; `SegBtn`; `buildCandPopup`; `RejectedTable`; candidate evaluation popup |
 | `src/components/ReplayPanel.jsx` | Step replay UI: ◀/▶ buttons, step counter, scrubable timeline |
 | `vite.config.js` | Dev server; serve-tiles plugin (HTTP 206 / range support) |
 
@@ -498,21 +561,73 @@ This avoids the O(N²) cost of recomputing from step 0 on every step during forw
 
 ## 15. Candidate colour key
 
-| Dot colour | `ctype` value | Meaning |
-|---|---|---|
-| Green (larger, white ring) | `accepted`, `winner: true` | Accepted and chosen as leg endpoint |
-| Green | `accepted`, `winner: false` | Accepted but beaten by another candidate's route cost |
-| Orange | `bearing` | Bearing outside `[LB−τ, UB+τ]` gate |
-| Yellow | `radius` | Outside candidate search radius |
-| Purple | `score` | Total score exceeded `max_candidate_score` |
-| Dark grey | `direction` | Wrong direction (one-way road) |
-| Light grey | `other` | Other / degenerate geometry |
+Candidates render as **coloured LineStrings** (`replay-candidates-line`) covering the full segment geometry, with direction triangles (`replay-candidates-arrow`, white SDF icons, 18px spacing) pointing in the traversal direction. Backward candidates have their coordinate arrays reversed before being set as GeoJSON features so the triangles always point in the direction of traversal, not the stored segment direction.
 
-A green dot overlaid with a smaller orange dot at the same location is a bidirectional road where one traversal direction was accepted and the opposite direction failed the bearing gate.
+| Line colour | `ctype` value | Meaning |
+|---|---|---|
+| Bright green (#00ff88), 4px | `accepted`, `winner: true` | Accepted and chosen as leg endpoint |
+| Green (#22cc66), 2.5px | `accepted`, `winner: false` | Accepted but beaten by another candidate's route cost |
+| Red (#dd3333), 1.5px | `bearing` / `radius` / `score` / `direction` / `other` | Rejected; reason available in the candidate popup |
+
+When the same bidirectional segment is a candidate in both Forward and Backward directions, both appear as separate features with reversed coordinates, producing opposite-direction arrows. To prevent confusion when a specific candidate is selected from the TracePanel, the `replay-candidates-arrow` layer is filtered to only the selected `segment_id` + `traversal` pair while the candidate popup is open.
 
 ---
 
-## 16. Known issues / next steps
+## 16. Direction triangles
+
+All path and candidate line layers use **SDF (Signed Distance Field) direction triangles** (`direction-triangle` image, registered with `{ sdf: true }`). SDF registration allows runtime colour tinting via `icon-color` and halo via `icon-halo-color` / `icon-halo-width` without separate image assets.
+
+| Layer | Source | `icon-color` | `icon-halo-color` | `icon-halo-width` | Spacing |
+|---|---|---|---|---|---|
+| `decoded-path-arrow` | `decoded-path` | `#004466` (dark navy) | white | 2px | 18px |
+| `replay-candidates-arrow` | `replay-candidates` | white | — | — | 18px |
+| `trace-segment-arrow` | `trace-segment` | green or red (set via `setPaintProperty`) | white | 4px | 18px |
+
+`trace-segment-arrow` is hidden by default (`visibility: 'none'`) and made visible by the `candidatePopup` effect. Its colour and halo are set via `map.setPaintProperty` at the same time: green (`#22cc66`) for accepted candidates, red (`#ee4444`) for rejected. The larger halo (4px vs 2px) and larger icon size (1.4×) ensure candidate arrows visually dominate over the underlying decoded-path arrows when both occupy the same road.
+
+---
+
+## 17. LLM Chat integration
+
+The **AI Chat** panel provides a conversational interface for decode diagnosis. It is implemented across:
+
+| File | Role |
+|---|---|
+| `src/llmClient.js` | HTTP client for OpenAI-compatible APIs (OpenAI, Anthropic, Mistral, local); `chatComplete(config, messages)` |
+| `src/llmDiagnosis.js` | `buildSystemContext(decodeResult, params)` — constructs a structured system prompt from the current decode result |
+| `src/llm/SYSTEM_PROMPT.md` | Template for the system prompt injected into every chat session |
+| `src/renderLlmText.jsx` | Renders LLM markdown responses (bold, code, lists) without pulling in a full markdown library |
+
+### Chat lifecycle
+
+1. User clicks **✦ AI Chat** in `ResultPanel`. If no `llmConfig` is set, opens the settings panel instead.
+2. `LlmChat.jsx` renders the message history from `llmMessages` store state.
+3. On send, `buildSystemContext(decodeResult, params)` is called to produce a system message containing: format, LRP table, candidate summary, route events, failure reason (if any), and current parameter values.
+4. `chatComplete(config, messages)` is called; `llmLoading` is set true. On completion, the assistant message is appended to `llmMessages`.
+5. The chat session persists across panel open/close within the same decode. `llmMessages` is cleared on a new decode.
+
+### Provider configuration
+
+Stored in `llmConfig` (persisted to localStorage via Zustand `persist`):
+
+```js
+{ provider: 'openai' | 'anthropic' | 'mistral' | 'custom', apiKey: string, model: string, baseUrl?: string }
+```
+
+---
+
+## 18. Segment diagnosis ("Why didn't the location cover this segment?")
+
+Available from the **ResultPanel** and from segment clicks in the **TracePanel routing section**. Implemented in `src/diagnosis.js`:
+
+- **`diagnoseFailure(decodeResult)`** — called when `decodeResult.ok === false`. Returns `{ headline, bullets, suggestions }` for the failure popup.
+- **`diagnoseSuccess(decodeResult)`** — called when `decodeResult.ok === true`. Returns a warning object when the success warrants a caution (e.g., only one candidate per LRP, very short path, large DNP gap).
+
+Both functions read from the trace events embedded in `decodeResult.trace` to produce human-readable summaries without requiring a separate API call.
+
+---
+
+## 19. Known issues / next steps
 
 - **No offline fallback for missing tiles**: if a PMTiles archive is unreachable,
   the decode fails with a generic error. A clear "tile not found" message would help.

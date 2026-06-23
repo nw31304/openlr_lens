@@ -192,8 +192,13 @@ location.
 *No error is returned. This is the most important class to diagnose and the
 primary reason this tool exists.*
 
-Currently requires manual inspection of the trace panel. The planned
-**forced-decode mode** (CLAUDE.md §10) will automate root-cause verdicts:
+Currently requires manual inspection of the trace panel. The **AI Chat** button in
+the ResultPanel (see WebFrontend.md §17) provides a conversational diagnostic aid:
+`buildSystemContext` injects the full trace into the LLM context so the model can
+reason about candidate scores, route choices, and parameter sensitivities. This is a
+human-in-the-loop tool, not an automated verdict.
+
+The planned **forced-decode mode** (CLAUDE.md §10) will automate root-cause verdicts:
 
 - **Decoder-tunable**: some parameter combination makes the correct path the
   strict unique winner — identified via closed-form gate margins and a linear

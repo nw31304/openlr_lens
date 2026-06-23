@@ -14,23 +14,24 @@ export default function App() {
   const [ready, setReady] = useState(false);
   const [error, setError] = useState(null);
   const [tilesBase, setTilesBase] = useState('/tiles');
+  const [urlDraft, setUrlDraft] = useState('');
+
+  function resolveBase() {
+    const tilesParam = new URLSearchParams(window.location.search).get('tiles') ?? '';
+    const storedUrl  = useStore.getState().tileUrl || 'http://localhost:5176';
+    if (tilesParam) {
+      const isAbsolute = tilesParam.startsWith('http://') || tilesParam.startsWith('https://');
+      return isAbsolute ? tilesParam : `http://localhost:5176/${tilesParam}`;
+    }
+    return storedUrl;
+  }
 
   useEffect(() => {
     async function setup() {
       try {
-        // ?tiles= URL param overrides the stored preference (useful for shareable
-        // links and dev overrides). Falls back to the persisted tileUrl, then the
-        // hardcoded dev default.
-        const tilesParam = new URLSearchParams(window.location.search).get('tiles') ?? '';
-        const storedUrl  = useStore.getState().tileUrl || 'http://localhost:5176';
-        let base;
-        if (tilesParam) {
-          const isAbsolute = tilesParam.startsWith('http://') || tilesParam.startsWith('https://');
-          base = isAbsolute ? tilesParam : `http://localhost:5176/${tilesParam}`;
-        } else {
-          base = storedUrl;
-        }
+        const base = resolveBase();
         setTilesBase(base);
+        setUrlDraft(base);
 
         console.log('[app] tile base:', base);
         const manifest = await fetch(`${base}/manifest.json`).then(r => r.json());
@@ -43,14 +44,36 @@ export default function App() {
         setReady(true);
       } catch (e) {
         setError(e.message);
+        setUrlDraft(resolveBase());
       }
     }
     setup();
-  }, []);
+  }, []);  // eslint-disable-line react-hooks/exhaustive-deps
+
+  function applyFixedUrl() {
+    const trimmed = urlDraft.trim();
+    if (!trimmed) return;
+    useStore.getState().setTileUrl(trimmed);
+    window.location.assign(window.location.pathname);
+  }
 
   if (error) return (
-    <div style={{position:'fixed',inset:0,display:'flex',alignItems:'center',justifyContent:'center',background:'#0a0a14',color:'#ff5566',fontFamily:'monospace',fontSize:14,padding:24,textAlign:'center'}}>
-      ⚠ Failed to initialize:<br/>{error}
+    <div style={{position:'fixed',inset:0,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:16,background:'#0a0a14',color:'#ff5566',fontFamily:'monospace',fontSize:14,padding:24,textAlign:'center'}}>
+      <div>⚠ Failed to initialize: {error}</div>
+      <div style={{color:'#aaa',fontSize:12}}>Check the tile server URL below and press Apply to retry.</div>
+      <div style={{display:'flex',gap:8,alignItems:'center'}}>
+        <input
+          style={{fontFamily:'monospace',fontSize:13,padding:'6px 10px',borderRadius:4,border:'1px solid #444',background:'#1a1a2e',color:'#eee',width:380}}
+          value={urlDraft}
+          onChange={e => setUrlDraft(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && applyFixedUrl()}
+          placeholder="http://localhost:5176"
+        />
+        <button
+          style={{padding:'6px 14px',fontFamily:'monospace',fontSize:13,borderRadius:4,border:'none',background:'#3355cc',color:'#fff',cursor:'pointer'}}
+          onClick={applyFixedUrl}
+        >Apply</button>
+      </div>
     </div>
   );
 
