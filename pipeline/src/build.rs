@@ -175,6 +175,8 @@ pub async fn run_generic(
     output:            &Path,
     tile_zoom:         u8,
     low_memory:        bool,
+    duckdb_memory_mb:  Option<u64>,
+    show_progress:     bool,
 ) -> Result<()> {
     std::fs::create_dir_all(output)?;
     let t0 = Instant::now();
@@ -188,6 +190,55 @@ pub async fn run_generic(
         label,
         "generic build started"
     );
+
+    // Low-memory path: hand off entirely to the DuckDB-backed pipeline.
+    if low_memory {
+        let roads       = roads_path.to_path_buf();
+        let restr       = restrictions_path.map(|p| p.to_path_buf());
+        let out_dir     = output.to_path_buf();
+        let ext_slug    = extent_slug.clone();
+        let label_owned = label.to_string();
+        tokio::task::spawn_blocking(move || {
+            crate::generic_low_memory::run_pipeline(
+                &roads,
+                restr.as_deref(),
+                &out_dir,
+                &ext_slug,
+                tile_zoom,
+                duckdb_memory_mb,
+                show_progress,
+            )
+        })
+        .await
+        .context("generic_low_memory panicked")??;
+
+        // Patch --label into manifest (same as in-memory path below).
+        if !label_owned.is_empty() {
+            let manifest_path = output.join("manifest.json");
+            if let Ok(text) = std::fs::read_to_string(&manifest_path) {
+                if let Ok(mut map) =
+                    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text)
+                {
+                    map.insert(
+                        "external_id_label".to_string(),
+                        serde_json::Value::String(label_owned.clone()),
+                    );
+                    if let Ok(updated) =
+                        serde_json::to_string_pretty(&serde_json::Value::Object(map))
+                    {
+                        let _ = std::fs::write(&manifest_path, updated);
+                    }
+                }
+            }
+        }
+
+        info!(
+            elapsed_s = t0.elapsed().as_secs_f32(),
+            output    = %output.display(),
+            "generic build complete"
+        );
+        return Ok(());
+    }
 
     // Step 1: extract ─────────────────────────────────────────────────────────
     let (edges, nodes, seg_to_to_int) = {

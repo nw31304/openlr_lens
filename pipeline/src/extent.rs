@@ -66,10 +66,21 @@ pub fn resolve(spec: &str) -> Result<Option<Bbox>> {
         if let Some(bbox) = country_bbox(spec.to_uppercase().as_str()) {
             return Ok(Some(bbox));
         }
-        bail!("unknown ISO 3166-1 country code '{spec}'");
+        bail!("unknown ISO 3166-1 alpha-2 country code '{spec}'");
     }
 
-    bail!("unrecognised --extent '{spec}'. Use a country code (NZ), continent, 'world', or 'west,south,east,north'");
+    // ISO 3166-1 alpha-3 country code
+    if spec.len() == 3 {
+        let upper = spec.to_uppercase();
+        if let Some(a2) = alpha3_to_alpha2(&upper) {
+            if let Some(bbox) = country_bbox(a2) {
+                return Ok(Some(bbox));
+            }
+        }
+        bail!("unknown ISO 3166-1 alpha-3 country code '{spec}'");
+    }
+
+    bail!("unrecognised --extent '{spec}'. Use a country code (NZ or NZL), continent, 'world', or 'west,south,east,north'");
 }
 
 fn continent_bbox(name: &str) -> Option<Bbox> {
@@ -279,6 +290,59 @@ fn country_bbox(code: &str) -> Option<Bbox> {
     Some(Bbox { west: w, south: s, east: e, north: n })
 }
 
+/// Map ISO 3166-1 alpha-3 → alpha-2 for every country in `country_bbox`.
+fn alpha3_to_alpha2(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "AND" => "AD", "ARE" => "AE", "AFG" => "AF", "ATG" => "AG",
+        "ALB" => "AL", "ARM" => "AM", "AGO" => "AO", "ARG" => "AR",
+        "AUT" => "AT", "AUS" => "AU", "AZE" => "AZ", "BIH" => "BA",
+        "BGD" => "BD", "BEL" => "BE", "BFA" => "BF", "BGR" => "BG",
+        "BEN" => "BJ", "BRN" => "BN", "BOL" => "BO", "BRA" => "BR",
+        "BTN" => "BT", "BWA" => "BW", "BLR" => "BY", "BLZ" => "BZ",
+        "CAN" => "CA", "COD" => "CD", "CAF" => "CF", "COG" => "CG",
+        "CHE" => "CH", "CIV" => "CI", "CHL" => "CL", "CMR" => "CM",
+        "CHN" => "CN", "COL" => "CO", "CRI" => "CR", "CUB" => "CU",
+        "CPV" => "CV", "CYP" => "CY", "CZE" => "CZ", "DEU" => "DE",
+        "DJI" => "DJ", "DNK" => "DK", "DOM" => "DO", "DZA" => "DZ",
+        "ECU" => "EC", "EST" => "EE", "EGY" => "EG", "ERI" => "ER",
+        "ESP" => "ES", "ETH" => "ET", "FIN" => "FI", "FJI" => "FJ",
+        "FRA" => "FR", "GAB" => "GA", "GBR" => "GB", "GEO" => "GE",
+        "GHA" => "GH", "GMB" => "GM", "GIN" => "GN", "GNQ" => "GQ",
+        "GRC" => "GR", "GTM" => "GT", "GNB" => "GW", "GUY" => "GY",
+        "HND" => "HN", "HRV" => "HR", "HTI" => "HT", "HUN" => "HU",
+        "IDN" => "ID", "IRL" => "IE", "ISR" => "IL", "IND" => "IN",
+        "IRQ" => "IQ", "IRN" => "IR", "ISL" => "IS", "ITA" => "IT",
+        "JAM" => "JM", "JOR" => "JO", "JPN" => "JP", "KEN" => "KE",
+        "KGZ" => "KG", "KHM" => "KH", "KIR" => "KI", "COM" => "KM",
+        "PRK" => "KP", "KOR" => "KR", "KWT" => "KW", "KAZ" => "KZ",
+        "LAO" => "LA", "LBN" => "LB", "LIE" => "LI", "LKA" => "LK",
+        "LBR" => "LR", "LSO" => "LS", "LTU" => "LT", "LUX" => "LU",
+        "LVA" => "LV", "LBY" => "LY", "MAR" => "MA", "MDA" => "MD",
+        "MNE" => "ME", "MDG" => "MG", "MKD" => "MK", "MLI" => "ML",
+        "MMR" => "MM", "MNG" => "MN", "MRT" => "MR", "MLT" => "MT",
+        "MUS" => "MU", "MDV" => "MV", "MWI" => "MW", "MEX" => "MX",
+        "MYS" => "MY", "MOZ" => "MZ", "NAM" => "NA", "NER" => "NE",
+        "NGA" => "NG", "NIC" => "NI", "NLD" => "NL", "NOR" => "NO",
+        "NPL" => "NP", "NRU" => "NR", "NZL" => "NZ", "OMN" => "OM",
+        "PAN" => "PA", "PER" => "PE", "PNG" => "PG", "PHL" => "PH",
+        "PAK" => "PK", "POL" => "PL", "PRT" => "PT", "PLW" => "PW",
+        "PRY" => "PY", "QAT" => "QA", "ROU" => "RO", "SRB" => "RS",
+        "RUS" => "RU", "RWA" => "RW", "SAU" => "SA", "SLB" => "SB",
+        "SYC" => "SC", "SDN" => "SD", "SWE" => "SE", "SGP" => "SG",
+        "SVN" => "SI", "SVK" => "SK", "SLE" => "SL", "SMR" => "SM",
+        "SEN" => "SN", "SOM" => "SO", "SUR" => "SR", "SSD" => "SS",
+        "STP" => "ST", "SLV" => "SV", "SYR" => "SY", "SWZ" => "SZ",
+        "TCD" => "TD", "TGO" => "TG", "THA" => "TH", "TJK" => "TJ",
+        "TLS" => "TL", "TKM" => "TM", "TUN" => "TN", "TON" => "TO",
+        "TUR" => "TR", "TTO" => "TT", "TUV" => "TV", "TZA" => "TZ",
+        "UKR" => "UA", "UGA" => "UG", "USA" => "US", "URY" => "UY",
+        "UZB" => "UZ", "VAT" => "VA", "VCT" => "VC", "VEN" => "VE",
+        "VNM" => "VN", "VUT" => "VU", "WSM" => "WS", "YEM" => "YE",
+        "ZAF" => "ZA", "ZMB" => "ZM", "ZWE" => "ZW",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,5 +368,21 @@ mod tests {
     fn continent_resolves() {
         let bbox = resolve("oceania").unwrap().unwrap();
         assert!(bbox.west < 112.0);
+    }
+
+    #[test]
+    fn alpha3_resolves_same_as_alpha2() {
+        let a2 = resolve("NZ").unwrap().unwrap();
+        let a3 = resolve("NZL").unwrap().unwrap();
+        assert_eq!(a2.west,  a3.west);
+        assert_eq!(a2.east,  a3.east);
+        assert_eq!(a2.south, a3.south);
+        assert_eq!(a2.north, a3.north);
+    }
+
+    #[test]
+    fn alpha3_case_insensitive() {
+        assert!(resolve("nzl").unwrap().is_some());
+        assert!(resolve("Nzl").unwrap().is_some());
     }
 }

@@ -92,7 +92,7 @@ struct ResolvedRestriction {
 
 // ── BLOB ↔ Rust helpers ───────────────────────────────────────────────────────
 
-fn geom_to_blob(geom: &[(i32, i32)]) -> Vec<u8> {
+pub(crate) fn geom_to_blob(geom: &[(i32, i32)]) -> Vec<u8> {
     let mut b = Vec::with_capacity(geom.len() * 8);
     for (x, y) in geom {
         b.extend_from_slice(&x.to_le_bytes());
@@ -246,7 +246,7 @@ fn build_lm_tile_payload(
 
 // ── Progress bar helpers ──────────────────────────────────────────────────────
 
-fn make_spinner(show: bool, msg: &'static str) -> ProgressBar {
+pub(crate) fn make_spinner(show: bool, msg: &'static str) -> ProgressBar {
     if !show { return ProgressBar::hidden(); }
     let pb = ProgressBar::new_spinner();
     pb.set_style(
@@ -258,7 +258,7 @@ fn make_spinner(show: bool, msg: &'static str) -> ProgressBar {
     pb
 }
 
-fn make_bar(show: bool, total: u64, msg: &'static str) -> ProgressBar {
+pub(crate) fn make_bar(show: bool, total: u64, msg: &'static str) -> ProgressBar {
     if !show { return ProgressBar::hidden(); }
     let pb = ProgressBar::new(total);
     pb.set_style(
@@ -888,7 +888,7 @@ fn fetch_intersection_nodes(conn: &Connection, ids: &[i64]) -> Result<HashSet<i6
 }
 
 /// Lossless collinear-vertex removal (mirror of quantize::remove_collinear).
-fn remove_collinear_lm(pts: Vec<(i32, i32)>) -> Vec<(i32, i32)> {
+pub(crate) fn remove_collinear_lm(pts: Vec<(i32, i32)>) -> Vec<(i32, i32)> {
     if pts.len() <= 2 { return pts; }
     let mut out = Vec::with_capacity(pts.len());
     out.push(pts[0]);

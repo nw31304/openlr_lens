@@ -8,6 +8,7 @@ mod http;
 mod merge;
 mod osm_adapt;
 mod osm_extract;
+mod generic_low_memory;
 mod osm_low_memory;
 mod osm_schema;
 mod parquet_meta;
@@ -73,6 +74,8 @@ async fn main() -> Result<()> {
                     &args.output,
                     args.tile_zoom,
                     args.low_memory,
+                    args.duckdb_memory_mb,
+                    args.progress,
                 )
                 .await?;
             } else {
