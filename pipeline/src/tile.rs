@@ -498,6 +498,7 @@ pub fn write_tiles(
     output_dir: &Path,
     release: &str,
     extent_slug: &str,
+    low_memory: bool,
 ) -> Result<()> {
     // Build node coordinate lookup: gers_id → (lon_e7, lat_e7).
     let node_lookup: HashMap<[u8; 16], (i32, i32)> = nodes
@@ -629,31 +630,93 @@ pub fn write_tiles(
         );
     }
 
-    // Build per-tile payloads.
-    let mut tile_vec: Vec<(u64, Vec<u8>)> = tile_bins
-        .iter()
-        .map(|(key, indices)| {
-            let tile_id = xyz_to_tile_id(key.z, key.x, key.y);
-            let (node_order, node_index) = &tile_nodes[key];
-            let intra = tile_intra.get(key).map(Vec::as_slice).unwrap_or(&[]);
-            let cross = tile_cross.get(key).map(Vec::as_slice).unwrap_or(&[]);
-            let payload = build_tile_payload(
-                indices, &edges, node_order, node_index,
-                &node_lookup, &boundary_nodes, intra, cross,
-            );
-            (tile_id, payload)
-        })
-        .collect();
-
-    // Sort by Hilbert tile_id for clustering.
-    tile_vec.sort_by_key(|(id, _)| *id);
-
     // Archive filename: openlrlens-{extent}-{release}.pmtiles
     let safe_release = release.replace('.', "-");
     let archive_filename = format!("openlrlens-{extent_slug}-{safe_release}.pmtiles");
     let archive_path = output_dir.join(&archive_filename);
 
-    write_pmtiles_file(&tile_vec, &archive_path, tile_zoom)?;
+    if low_memory {
+        // ── DuckDB-buffered path ──────────────────────────────────────────────
+        // Build payloads one tile at a time, inserting into an in-memory DuckDB
+        // table that spills to disk automatically when the memory limit is hit.
+        // Then stream back in Hilbert order via StreamingWriter — peak heap usage
+        // is O(one tile payload) rather than O(all tile payloads).
+        use duckdb::Connection;
+
+        let avail_bytes = crate::partition::available_ram_bytes();
+        // Use 40 % of currently available RAM for DuckDB; leave the rest for
+        // the edges Vec (already allocated) and OS overhead.
+        let limit_mb = ((avail_bytes as f64 * 0.40) / 1_048_576.0) as u64;
+        let limit_mb = limit_mb.max(512); // floor at 512 MB
+
+        let conn = Connection::open_in_memory()
+            .context("open DuckDB connection")?;
+        conn.execute_batch(&format!(
+            "SET memory_limit='{limit_mb}MB'; \
+             CREATE TABLE tile_buf (tile_id UBIGINT, payload BLOB);"
+        ))
+        .context("DuckDB setup")?;
+
+        info!(
+            tiles = tile_bins.len(),
+            duckdb_limit_mb = limit_mb,
+            "low-memory: buffering tile payloads via DuckDB"
+        );
+
+        {
+            let mut stmt = conn
+                .prepare("INSERT INTO tile_buf VALUES (?, ?)")
+                .context("prepare INSERT")?;
+            for (key, indices) in &tile_bins {
+                let tile_id = xyz_to_tile_id(key.z, key.x, key.y);
+                let (node_order, node_index) = &tile_nodes[key];
+                let intra = tile_intra.get(key).map(Vec::as_slice).unwrap_or(&[]);
+                let cross = tile_cross.get(key).map(Vec::as_slice).unwrap_or(&[]);
+                let payload = build_tile_payload(
+                    indices, &edges, node_order, node_index,
+                    &node_lookup, &boundary_nodes, intra, cross,
+                );
+                stmt.execute(duckdb::params![tile_id, payload])
+                    .context("INSERT tile")?;
+            }
+        }
+
+        info!("low-memory: streaming tiles from DuckDB → PMTiles");
+
+        let mut writer = crate::merge::StreamingWriter::new()
+            .context("create StreamingWriter")?;
+        {
+            let mut stmt = conn
+                .prepare("SELECT tile_id, payload FROM tile_buf ORDER BY tile_id")
+                .context("prepare SELECT")?;
+            let mut rows = stmt.query([]).context("query tiles")?;
+            while let Some(row) = rows.next().context("next row")? {
+                let tile_id: u64 = row.get(0).context("get tile_id")?;
+                let payload: Vec<u8> = row.get(1).context("get payload")?;
+                writer.add_tile(tile_id, &payload).context("add tile")?;
+            }
+        }
+        writer.finish(&archive_path, tile_zoom).context("finish PMTiles")?;
+    } else {
+        // ── Default in-memory path ────────────────────────────────────────────
+        // Build all payloads into a Vec, sort by Hilbert tile_id, write at once.
+        let mut tile_vec: Vec<(u64, Vec<u8>)> = tile_bins
+            .iter()
+            .map(|(key, indices)| {
+                let tile_id = xyz_to_tile_id(key.z, key.x, key.y);
+                let (node_order, node_index) = &tile_nodes[key];
+                let intra = tile_intra.get(key).map(Vec::as_slice).unwrap_or(&[]);
+                let cross = tile_cross.get(key).map(Vec::as_slice).unwrap_or(&[]);
+                let payload = build_tile_payload(
+                    indices, &edges, node_order, node_index,
+                    &node_lookup, &boundary_nodes, intra, cross,
+                );
+                (tile_id, payload)
+            })
+            .collect();
+        tile_vec.sort_by_key(|(id, _)| *id);
+        write_pmtiles_file(&tile_vec, &archive_path, tile_zoom)?;
+    }
     info!(path = %archive_path.display(), "PMTiles archive written");
 
     write_manifest(output_dir, &archive_filename, release, extent_slug, tile_zoom)?;

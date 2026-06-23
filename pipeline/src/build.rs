@@ -27,6 +27,7 @@ pub async fn run_osm(
     osm_schema:  &OsmSchemaMapping,
     output:      &Path,
     tile_zoom:   u8,
+    low_memory:  bool,
 ) -> Result<()> {
     std::fs::create_dir_all(output)?;
     let t0 = Instant::now();
@@ -119,6 +120,7 @@ pub async fn run_osm(
             crate::tile::write_tiles(
                 q_edges, q_nodes, restrictions,
                 tile_zoom, &output_dir, &release_label, &extent_slug,
+                low_memory,
             )
         })
         .await
@@ -146,6 +148,7 @@ pub async fn run_generic(
     extent_spec:       &str,
     output:            &Path,
     tile_zoom:         u8,
+    low_memory:        bool,
 ) -> Result<()> {
     std::fs::create_dir_all(output)?;
     let t0 = Instant::now();
@@ -220,6 +223,7 @@ pub async fn run_generic(
             crate::tile::write_tiles(
                 q_edges, q_nodes, restrictions,
                 tile_zoom, &output_dir, "generic", &extent_slug2,
+                low_memory,
             )
         })
         .await
@@ -267,6 +271,7 @@ pub async fn run(
     tile_zoom:         u8,
     ram_gb_override:   Option<f64>,
     bytes_per_segment: u64,
+    low_memory:        bool,
 ) -> Result<()> {
     std::fs::create_dir_all(output)?;
 
@@ -291,7 +296,7 @@ pub async fn run(
         // ── Single-shot ────────────────────────────────────────────────────────
         run_partition(
             release, bbox, schema, output, client,
-            fetch_concurrency, tile_zoom, &extent_slug,
+            fetch_concurrency, tile_zoom, &extent_slug, low_memory,
         )
         .await
     } else {
@@ -318,7 +323,7 @@ pub async fn run(
 
             run_partition(
                 release, Some(*part_bbox), schema, &part_out, client,
-                fetch_concurrency, tile_zoom, &part_slug,
+                fetch_concurrency, tile_zoom, &part_slug, low_memory,
             )
             .await?;
 
@@ -336,7 +341,7 @@ pub async fn run(
                 output   = %final_pmtiles.display(),
                 "merging partition archives"
             );
-            crate::merge::merge_pmtiles(&part_pmtiles, &final_pmtiles)?;
+            crate::merge::merge_pmtiles(&part_pmtiles, &final_pmtiles, tile_zoom)?;
         }
 
         // Write a single manifest for the merged archive.
@@ -363,6 +368,7 @@ async fn run_partition(
     fetch_concurrency: usize,
     tile_zoom:         u8,
     extent_slug:       &str,
+    low_memory:        bool,
 ) -> Result<()> {
     let t0 = Instant::now();
 
@@ -475,6 +481,7 @@ async fn run_partition(
             crate::tile::write_tiles(
                 q_edges, q_nodes, restrictions,
                 tile_zoom, &output_dir, &release, &extent_slug,
+                low_memory,
             )
         })
         .await

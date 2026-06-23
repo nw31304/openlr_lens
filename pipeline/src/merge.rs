@@ -218,26 +218,26 @@ fn read_section(file: &mut File, offset: u64, length: u64) -> Result<Vec<u8>> {
 
 // ── Streaming PMTiles writer ──────────────────────────────────────────────────
 
-struct StreamingWriter {
+pub(crate) struct StreamingWriter {
     tile_data_tmp:  NamedTempFile,
     entries:        Vec<(u64, u64, u32)>,   // (tile_id, offset, length)
     current_offset: u64,
 }
 
 impl StreamingWriter {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         let tile_data_tmp = NamedTempFile::new().context("create tile data temp file")?;
         Ok(Self { tile_data_tmp, entries: Vec::new(), current_offset: 0 })
     }
 
-    fn add_tile(&mut self, tile_id: u64, data: &[u8]) -> Result<()> {
+    pub(crate) fn add_tile(&mut self, tile_id: u64, data: &[u8]) -> Result<()> {
         self.tile_data_tmp.write_all(data).context("write tile data")?;
         self.entries.push((tile_id, self.current_offset, data.len() as u32));
         self.current_offset += data.len() as u64;
         Ok(())
     }
 
-    fn finish(mut self, output_path: &Path) -> Result<()> {
+    pub(crate) fn finish(mut self, output_path: &Path, tile_zoom: u8) -> Result<()> {
         let n_tiles = self.entries.len() as u64;
         let (root_compressed, leaf_data) = build_directory(&self.entries)?;
 
@@ -269,6 +269,8 @@ impl StreamingWriter {
         hdr[97] = 2; // internal_compression = gzip
         hdr[98] = 1; // tile_compression = none (payloads are not re-compressed)
         hdr[99] = 0; // tile_type = unknown/custom
+        hdr[100] = tile_zoom; // min_zoom
+        hdr[101] = tile_zoom; // max_zoom
 
         let mut out = File::create(output_path)
             .with_context(|| format!("create {}", output_path.display()))?;
@@ -300,7 +302,7 @@ impl StreamingWriter {
 /// output is clustered.
 ///
 /// Memory usage: O(N) where N = number of input archives (one buffered tile per reader).
-pub fn merge_pmtiles(inputs: &[PathBuf], output: &Path) -> Result<()> {
+pub fn merge_pmtiles(inputs: &[PathBuf], output: &Path, tile_zoom: u8) -> Result<()> {
     anyhow::ensure!(!inputs.is_empty(), "merge_pmtiles: no input archives");
 
     if inputs.len() == 1 {
@@ -349,7 +351,7 @@ pub fn merge_pmtiles(inputs: &[PathBuf], output: &Path) -> Result<()> {
     }
 
     info!(tiles = n_merged, archives = inputs.len(), output = %output.display(), "merge complete");
-    writer.finish(output)?;
+    writer.finish(output, tile_zoom)?;
     Ok(())
 }
 

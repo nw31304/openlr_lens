@@ -71,6 +71,7 @@ async fn main() -> Result<()> {
                     &args.extent,
                     &args.output,
                     args.tile_zoom,
+                    args.low_memory,
                 )
                 .await?;
             } else {
@@ -104,6 +105,7 @@ async fn main() -> Result<()> {
                             &osm_schema,
                             &args.output,
                             args.tile_zoom,
+                            args.low_memory,
                         )
                         .await?;
                     }
@@ -138,6 +140,7 @@ async fn main() -> Result<()> {
                             args.tile_zoom,
                             args.ram_gb,
                             args.bytes_per_segment,
+                            args.low_memory,
                         )
                         .await?;
                     }
@@ -200,7 +203,7 @@ fn run_merge(args: MergeArgs) -> Result<()> {
             .with_context(|| format!("create output directory {}", parent.display()))?;
     }
 
-    merge::merge_pmtiles(&pmtiles_paths, &args.output)?;
+    merge::merge_pmtiles(&pmtiles_paths, &args.output, tile_zoom)?;
 
     // Write manifest.json alongside the output archive.
     let archive_name = args.output

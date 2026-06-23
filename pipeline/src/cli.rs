@@ -111,6 +111,13 @@ pub struct BuildArgs {
     /// decrease to allow fewer, larger partitions on machines with ample RAM.
     #[arg(long, default_value_t = crate::partition::DEFAULT_BYTES_PER_SEGMENT)]
     pub bytes_per_segment: u64,
+
+    /// Use disk-backed tile buffering (DuckDB) instead of accumulating all tile
+    /// payloads in RAM. Recommended when building large regions (continents, world)
+    /// on machines with less than 32 GB RAM. Correct output either way; slower due
+    /// to I/O overhead on the tile stage.
+    #[arg(long)]
+    pub low_memory: bool,
 }
 
 #[derive(clap::Args)]
