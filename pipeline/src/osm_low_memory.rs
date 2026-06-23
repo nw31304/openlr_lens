@@ -15,14 +15,34 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
+use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use duckdb::{params, Connection};
 use indicatif::{ProgressBar, ProgressStyle};
-use std::time::Duration;
 use osmpbf::{Element, ElementReader, RelMemberType};
 use tracing::{info, warn};
+
+// ── Byte-counting reader ──────────────────────────────────────────────────────
+
+/// Wraps any `Read` and atomically tracks how many bytes have been consumed.
+/// Used to drive a file-size-based progress bar without re-scanning the file.
+struct CountingReader<R: Read> {
+    inner: R,
+    count: Arc<AtomicU64>,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.count.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
 
 use crate::extent::Bbox;
 use crate::merge::StreamingWriter;
@@ -260,6 +280,21 @@ pub(crate) fn make_spinner(show: bool, msg: &'static str) -> ProgressBar {
     pb
 }
 
+/// Progress bar that displays `bytes_read / total_bytes` with a percentage bar.
+/// Used for the two PBF scan passes where file size is the natural denominator.
+pub(crate) fn make_bytes_bar(show: bool, total_bytes: u64, msg: &'static str) -> ProgressBar {
+    if !show { return ProgressBar::hidden(); }
+    let pb = ProgressBar::new(total_bytes);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{msg:32} [{bar:40.cyan/blue}] {bytes}/{total_bytes}  eta {eta}")
+            .expect("valid template")
+            .progress_chars("█▉▊▋▌▍▎▏ "),
+    );
+    pb.set_message(msg);
+    pb
+}
+
 pub(crate) fn make_bar(show: bool, total: u64, msg: &'static str) -> ProgressBar {
     if !show { return ProgressBar::hidden(); }
     let pb = ProgressBar::new(total);
@@ -352,11 +387,21 @@ fn flush_way_batch(
 }
 
 fn extract_pass1(pbf_path: &Path, schema: &OsmSchemaMapping, conn: &Connection, show_progress: bool) -> Result<usize> {
-    let pb = make_spinner(show_progress, "Pass 1/2  scanning ways ");
+    let file_size = std::fs::metadata(pbf_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let bytes_read = Arc::new(AtomicU64::new(0));
+    let pb = make_bytes_bar(show_progress, file_size, "Pass 1/2  scanning ways ");
     let mut ways_scanned: u64 = 0;
     let mut elements_seen: u64 = 0;
 
-    let reader = ElementReader::from_path(pbf_path)?;
+    let file = std::fs::File::open(pbf_path)
+        .with_context(|| format!("open {}", pbf_path.display()))?;
+    let counting = CountingReader {
+        inner: std::io::BufReader::new(file),
+        count: Arc::clone(&bytes_read),
+    };
+    let reader = ElementReader::new(counting);
 
     let mut way_batch: Vec<WayRecord>        = Vec::with_capacity(WAY_BATCH + 64);
     let mut delta_batch: Vec<(i64, i64)>     = Vec::with_capacity(WAY_BATCH * 12);
@@ -366,8 +411,8 @@ fn extract_pass1(pbf_path: &Path, schema: &OsmSchemaMapping, conn: &Connection, 
     reader.for_each(|el| {
         if err.is_some() { return; }
         elements_seen += 1;
-        if elements_seen % 100_000 == 0 {
-            pb.set_position(ways_scanned);
+        if elements_seen % 50_000 == 0 {
+            pb.set_position(bytes_read.load(Ordering::Relaxed));
         }
         match el {
             Element::Way(w) => {
@@ -531,8 +576,13 @@ fn compute_derived_tables(conn: &Connection) -> Result<usize> {
 // ── Phase 2: Extract node coordinates ─────────────────────────────────────────
 
 fn extract_pass2(pbf_path: &Path, conn: &Connection, show_progress: bool) -> Result<usize> {
-    let pb = make_spinner(show_progress, "Pass 2/2  scanning nodes");
+    let file_size = std::fs::metadata(pbf_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let bytes_read = Arc::new(AtomicU64::new(0));
+    let pb = make_bytes_bar(show_progress, file_size, "Pass 2/2  scanning nodes");
     let mut nodes_scanned: u64 = 0;
+    let mut elements_seen: u64 = 0;
     // Staging table for batch semi-joins.
     conn.execute_batch(
         "CREATE TEMP TABLE _node_staging (id BIGINT, lon DOUBLE, lat DOUBLE)"
@@ -542,9 +592,19 @@ fn extract_pass2(pbf_path: &Path, conn: &Connection, show_progress: bool) -> Res
     let mut batch: Vec<(i64, f64, f64)> = Vec::with_capacity(NODE_BATCH);
     let mut err: Option<anyhow::Error> = None;
 
-    let reader = ElementReader::from_path(pbf_path)?;
+    let file = std::fs::File::open(pbf_path)
+        .with_context(|| format!("open {}", pbf_path.display()))?;
+    let counting = CountingReader {
+        inner: std::io::BufReader::new(file),
+        count: Arc::clone(&bytes_read),
+    };
+    let reader = ElementReader::new(counting);
     reader.for_each(|el| {
         if err.is_some() { return; }
+        elements_seen += 1;
+        if elements_seen % 50_000 == 0 {
+            pb.set_position(bytes_read.load(Ordering::Relaxed));
+        }
         let (id, lon, lat) = match el {
             Element::Node(n)      => (n.id(), n.lon(), n.lat()),
             Element::DenseNode(n) => (n.id(), n.lon(), n.lat()),
@@ -552,9 +612,6 @@ fn extract_pass2(pbf_path: &Path, conn: &Connection, show_progress: bool) -> Res
         };
         batch.push((id, lon, lat));
         nodes_scanned += 1;
-        if nodes_scanned % (NODE_BATCH as u64) == 0 {
-            pb.set_position(nodes_scanned);
-        }
         if batch.len() >= NODE_BATCH {
             if let Err(e) = flush_node_batch(conn, &mut batch) {
                 err = Some(e);
