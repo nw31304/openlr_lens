@@ -988,8 +988,8 @@ pub(crate) fn tile_from_duckdb(
     }
     info!(nodes = node_lookup.len(), "node_lookup loaded");
 
-    // ── Scan edge metadata to build tile_bins, boundary_nodes, edge maps ─────
-    let mut tile_bins: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
+    // ── Scan edge metadata to build boundary_nodes, edge maps, tile count ───────
+    let mut seen_tile_ids: HashSet<u64>  = HashSet::new();
     let mut node_tile_id: HashMap<[u8; 16], u64> = HashMap::new(); // gers → first tile_id seen (u64::MAX = boundary)
     let mut from_edge_map: HashMap<([u8; 16], [u8; 16]), u32> = HashMap::new();
     let mut to_edge_map:   HashMap<([u8; 16], [u8; 16]), u32> = HashMap::new();
@@ -1000,8 +1000,8 @@ pub(crate) fn tile_from_duckdb(
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let edge_idx: u32 = row.get::<_, i64>(0)? as u32;
-            let start_blob: Vec<u8> = row.get(1)?;
-            let end_blob:   Vec<u8> = row.get(2)?;
+            let start_blob:  Vec<u8> = row.get(1)?;
+            let end_blob:    Vec<u8> = row.get(2)?;
             let parent_blob: Vec<u8> = row.get(3)?;
             let tile_x: u32  = row.get::<_, i64>(4)? as u32;
             let tile_y: u32  = row.get::<_, i64>(5)? as u32;
@@ -1011,7 +1011,7 @@ pub(crate) fn tile_from_duckdb(
             let end_gers    = blob_to_gers(&end_blob);
             let parent_gers = blob_to_gers(&parent_blob);
 
-            tile_bins.entry((tile_x, tile_y)).or_default().push(edge_idx);
+            seen_tile_ids.insert(tile_id);
 
             // Boundary node detection: node is boundary if it appears in 2+ different tiles.
             for gers in [start_gers, end_gers] {
@@ -1023,6 +1023,8 @@ pub(crate) fn tile_from_duckdb(
             to_edge_map.insert(  (parent_gers, start_gers), edge_idx);
         }
     }
+    let total_tiles = seen_tile_ids.len();
+    drop(seen_tile_ids);
     let boundary_nodes: HashSet<[u8; 16]> = node_tile_id
         .into_iter()
         .filter(|(_, v)| *v == u64::MAX)
@@ -1030,8 +1032,8 @@ pub(crate) fn tile_from_duckdb(
         .collect();
 
     info!(
-        tiles           = tile_bins.len(),
-        boundary_nodes  = boundary_nodes.len(),
+        tiles          = total_tiles,
+        boundary_nodes = boundary_nodes.len(),
         "tile metadata scanned"
     );
 
@@ -1081,159 +1083,143 @@ pub(crate) fn tile_from_duckdb(
             .push(r);
     }
 
-    // ── Sort tiles by Hilbert tile_id ─────────────────────────────────────────
-    let mut tile_keys: Vec<(u32, u32)> = tile_bins.keys().copied().collect();
-    tile_keys.sort_by_key(|(x, y)| xyz_to_tile_id(tile_zoom, *x, *y));
-
-    // ── Stream tiles → PMTiles ────────────────────────────────────────────────
+    // ── Stream all edges ordered by Hilbert tile_id — one scan, zero per-tile queries ──
+    // DuckDB sorts 70M rows by tile_id (in-memory with the available budget) once,
+    // then streams them back.  We accumulate edges for the current tile and flush
+    // each tile as soon as the tile_id changes, so peak RAM is one tile's edges.
     let safe_release = release_label.replace('.', "-");
     let archive_filename = format!("openlrlens-{extent_slug}-{safe_release}.pmtiles");
     let archive_path = output_dir.join(&archive_filename);
 
     let mut writer = StreamingWriter::new().context("create StreamingWriter")?;
-
-    let total_tiles = tile_keys.len();
     let pb = make_bar(show_progress, total_tiles as u64, "Tiling              ");
     let mut done_tiles = 0usize;
 
-    for (tile_x, tile_y) in &tile_keys {
-        let tile_id = xyz_to_tile_id(tile_zoom, *tile_x, *tile_y);
-        let edge_indices = &tile_bins[&(*tile_x, *tile_y)];
+    {
+        let mut stmt = conn.prepare(
+            "SELECT edge_idx, start_gers, end_gers, parent_gers, geom_blob, length_cm, \
+                    frc, fow, direction, tile_x, tile_y, tile_id \
+             FROM q_edges ORDER BY tile_id, edge_idx"
+        ).context("prepare tiling scan")?;
+        let mut rows = stmt.query([]).context("execute tiling scan")?;
 
-        // Load full edge data for this tile.
-        let edges = fetch_tile_edges(conn, *tile_x, *tile_y, edge_indices)?;
+        let mut cur_tile:  Option<(u32, u32, u64)> = None; // (tile_x, tile_y, tile_id)
+        let mut cur_edges: Vec<LmEdge>              = Vec::new();
 
-        let (node_order, node_index) = compute_tile_nodes_lm(&edges);
+        while let Some(row) = rows.next()? {
+            let edge_idx: u32 = row.get::<_, i64>(0)? as u32;
+            let start:  Vec<u8> = row.get(1)?;
+            let end:    Vec<u8> = row.get(2)?;
+            let parent: Vec<u8> = row.get(3)?;
+            let geom:   Vec<u8> = row.get(4)?;
+            let len_cm: u32     = row.get::<_, i64>(5)? as u32;
+            let frc:    u8      = row.get::<_, i64>(6)? as u8;
+            let fow:    u8      = row.get::<_, i64>(7)? as u8;
+            let dir:    u8      = row.get::<_, i64>(8)? as u8;
+            let tile_x: u32     = row.get::<_, i64>(9)? as u32;
+            let tile_y: u32     = row.get::<_, i64>(10)? as u32;
+            let tile_id: u64    = row.get::<_, i64>(11)? as u64;
 
-        // Build intra/cross restriction lists for this tile.
-        let mut intra: Vec<LmIntraTile>  = Vec::new();
-        let mut cross: Vec<LmCrossTile>  = Vec::new();
-
-        if let Some(restrs) = tile_restrictions.get(&(*tile_x, *tile_y)) {
-            // Local segment index: edge_idx → position in this tile's edge list.
-            let local_for_edge: HashMap<u32, u32> = edges
-                .iter()
-                .enumerate()
-                .map(|(i, e)| (e.edge_idx, i as u32))
-                .collect();
-
-            for r in restrs {
-                let via_node_local = match node_index.get(&r.via_gers) {
-                    Some(&i) => i, None => continue,
-                };
-
-                // Tile of the from and to edges.
-                let from_tile = tile_bins.iter().find(|(_, v)| v.contains(&r.from_edge_idx)).map(|(k, _)| *k);
-                let to_tile   = tile_bins.iter().find(|(_, v)| v.contains(&r.to_edge_idx)).map(|(k, _)| *k);
-
-                let is_intra = from_tile == Some((*tile_x, *tile_y))
-                            && to_tile   == Some((*tile_x, *tile_y));
-
-                if is_intra {
-                    if let (Some(&fl), Some(&tl)) = (
-                        local_for_edge.get(&r.from_edge_idx),
-                        local_for_edge.get(&r.to_edge_idx),
-                    ) {
-                        intra.push(LmIntraTile {
-                            from_seg: fl,
-                            via_node: via_node_local,
-                            to_seg:   tl,
-                            flags:    r.flags,
-                        });
+            if let Some((cx, cy, cid)) = cur_tile {
+                if (tile_x, tile_y) != (cx, cy) {
+                    flush_tile(cid, cx, cy, &cur_edges,
+                               &node_lookup, &boundary_nodes, &tile_restrictions,
+                               &mut writer)?;
+                    cur_edges.clear();
+                    done_tiles += 1;
+                    pb.inc(1);
+                    if done_tiles % 10_000 == 0 {
+                        info!(done = done_tiles, total = total_tiles, "tiling progress");
                     }
-                } else {
-                    cross.push(LmCrossTile {
-                        from_gers: r.from_gers,
-                        via_node_local,
-                        to_gers: r.to_gers,
-                        flags: r.flags,
-                    });
                 }
             }
+            cur_tile = Some((tile_x, tile_y, tile_id));
+            cur_edges.push(LmEdge {
+                edge_idx,
+                start_gers:  blob_to_gers(&start),
+                end_gers:    blob_to_gers(&end),
+                parent_gers: blob_to_gers(&parent),
+                geom:        blob_to_geom(&geom),
+                length_cm:   len_cm,
+                frc, fow, direction: dir,
+            });
         }
 
-        let payload = build_lm_tile_payload(
-            &edges, &node_order, &node_index,
-            &node_lookup, &boundary_nodes, &intra, &cross,
-        );
-        writer.add_tile(tile_id, &payload).context("add_tile")?;
-
-        done_tiles += 1;
-        pb.inc(1);
-        if done_tiles % 10_000 == 0 {
-            info!(done = done_tiles, total = total_tiles, "tiling progress");
+        // Flush the final tile.
+        if let Some((cx, cy, cid)) = cur_tile {
+            if !cur_edges.is_empty() {
+                flush_tile(cid, cx, cy, &cur_edges,
+                           &node_lookup, &boundary_nodes, &tile_restrictions,
+                           &mut writer)?;
+                done_tiles += 1;
+                pb.inc(1);
+            }
         }
     }
 
     pb.finish_and_clear();
     writer.finish(&archive_path, tile_zoom).context("finish PMTiles")?;
-    info!(path = %archive_path.display(), tiles = total_tiles, "PMTiles archive written");
+    info!(path = %archive_path.display(), tiles = done_tiles, "PMTiles archive written");
 
     // Write manifest.json
     write_lm_manifest(output_dir, &archive_filename, release_label, extent_slug, tile_zoom)?;
     Ok(())
 }
 
-fn fetch_tile_edges(
-    conn: &Connection,
+fn flush_tile(
+    tile_id: u64,
     tile_x: u32,
     tile_y: u32,
-    edge_indices: &[u32],
-) -> Result<Vec<LmEdge>> {
-    if edge_indices.is_empty() { return Ok(vec![]); }
+    edges: &[LmEdge],
+    node_lookup: &HashMap<[u8; 16], (i32, i32)>,
+    boundary_nodes: &HashSet<[u8; 16]>,
+    tile_restrictions: &HashMap<(u32, u32), Vec<&ResolvedRestriction>>,
+    writer: &mut StreamingWriter,
+) -> Result<()> {
+    let (node_order, node_index) = compute_tile_nodes_lm(edges);
 
-    // Build a query filtered by tile coordinates (uses idx_q_edges_tile).
-    let ids_str = edge_indices.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
-    let sql = format!(
-        "SELECT edge_idx, start_gers, end_gers, parent_gers, geom_blob, length_cm, frc, fow, direction \
-         FROM q_edges WHERE tile_x = {} AND tile_y = {} AND edge_idx IN ({}) ORDER BY edge_idx",
-        tile_x, tile_y, ids_str
-    );
+    let mut intra: Vec<LmIntraTile> = Vec::new();
+    let mut cross: Vec<LmCrossTile> = Vec::new();
 
-    struct TileEdgeRow {
-        edge_idx: u32,
-        start:    Vec<u8>,
-        end:      Vec<u8>,
-        parent:   Vec<u8>,
-        geom:     Vec<u8>,
-        len_cm:   u32,
-        frc:      u8,
-        fow:      u8,
-        dir:      u8,
+    if let Some(restrs) = tile_restrictions.get(&(tile_x, tile_y)) {
+        // Build local edge index once per tile (replaces the O(N) tile_bins scan).
+        let local_for_edge: HashMap<u32, u32> = edges
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.edge_idx, i as u32))
+            .collect();
+
+        for r in restrs {
+            let Some(&via_node_local) = node_index.get(&r.via_gers) else { continue };
+
+            // A restriction is intra-tile iff both its from and to edges are in this tile.
+            let is_intra = local_for_edge.contains_key(&r.from_edge_idx)
+                        && local_for_edge.contains_key(&r.to_edge_idx);
+
+            if is_intra {
+                if let (Some(&fl), Some(&tl)) = (
+                    local_for_edge.get(&r.from_edge_idx),
+                    local_for_edge.get(&r.to_edge_idx),
+                ) {
+                    intra.push(LmIntraTile { from_seg: fl, via_node: via_node_local, to_seg: tl, flags: r.flags });
+                }
+            } else {
+                cross.push(LmCrossTile {
+                    from_gers: r.from_gers,
+                    via_node_local,
+                    to_gers: r.to_gers,
+                    flags: r.flags,
+                });
+            }
+        }
     }
 
-    let mut stmt = conn.prepare(&sql)?;
-    let rows: Vec<TileEdgeRow> = stmt
-        .query_map([], |r| {
-            Ok(TileEdgeRow {
-                edge_idx: r.get::<_, i64>(0)? as u32,
-                start:    r.get(1)?,
-                end:      r.get(2)?,
-                parent:   r.get(3)?,
-                geom:     r.get(4)?,
-                len_cm:   r.get::<_, i64>(5)? as u32,
-                frc:      r.get::<_, i64>(6)? as u8,
-                fow:      r.get::<_, i64>(7)? as u8,
-                dir:      r.get::<_, i64>(8)? as u8,
-            })
-        })?
-        .collect::<duckdb::Result<Vec<_>>>()
-        .context("fetch_tile_edges")?;
-
-    Ok(rows
-        .into_iter()
-        .map(|r| LmEdge {
-            edge_idx:   r.edge_idx,
-            start_gers: blob_to_gers(&r.start),
-            end_gers:   blob_to_gers(&r.end),
-            parent_gers: blob_to_gers(&r.parent),
-            geom:        blob_to_geom(&r.geom),
-            length_cm:   r.len_cm,
-            frc:         r.frc,
-            fow:         r.fow,
-            direction:   r.dir,
-        })
-        .collect())
+    let payload = build_lm_tile_payload(
+        edges, &node_order, &node_index,
+        node_lookup, boundary_nodes, &intra, &cross,
+    );
+    writer.add_tile(tile_id, &payload).context("add_tile")?;
+    Ok(())
 }
 
 fn write_lm_manifest(
