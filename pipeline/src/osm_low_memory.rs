@@ -322,18 +322,19 @@ fn setup_duckdb(memory_mb_override: Option<u64>, temp_dir: &Path) -> Result<Conn
         }
     };
 
-    // Enable DuckDB disk spilling: when the memory limit is exceeded during large
-    // operations (e.g. GROUP BY on 300-400M rows for continental PBFs), DuckDB
-    // streams intermediate state through this directory rather than OOMing.
-    // The caller is responsible for choosing a path on real disk (not tmpfs).
-    std::fs::create_dir_all(temp_dir).ok();
-    let tmp_str = temp_dir.to_string_lossy().replace('\'', "");
+    // Use a file-backed DuckDB database so table data lives on disk rather than
+    // in RAM.  The memory_limit then controls only the buffer pool (how much
+    // data is cached in RAM at once).  This means the 300-400M-row GROUP BY on
+    // node_ref_deltas can spill naturally through the buffer manager without any
+    // extra temp_directory configuration — file-backed storage IS the spill
+    // target.  In-memory DuckDB does not spill regardless of temp_directory.
+    std::fs::create_dir_all(temp_dir).context("create DuckDB temp dir")?;
+    let db_file = temp_dir.join("pipeline.duckdb");
 
-    let conn = Connection::open_in_memory().context("open DuckDB")?;
+    let conn = Connection::open(&db_file).context("open DuckDB")?;
     conn.execute_batch(&format!(
         "PRAGMA threads={threads}; \
          SET memory_limit='{limit_mb}MB'; \
-         SET temp_directory='{tmp_str}'; \
          SET preserve_insertion_order=false; \
          CREATE TABLE ways (id BIGINT, frc INTEGER, fow INTEGER, direction INTEGER, node_ids BLOB); \
          CREATE TABLE restrictions_raw (from_way_id BIGINT, via_node_id BIGINT, to_way_id BIGINT); \
