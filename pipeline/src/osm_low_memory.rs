@@ -271,7 +271,7 @@ pub(crate) fn make_spinner(show: bool, msg: &'static str) -> ProgressBar {
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
-            .template("{spinner:.cyan} {msg} [{elapsed_precise}] {human_pos}")
+            .template("{spinner:.cyan} {msg} [{elapsed_precise}]")
             .expect("valid template"),
     );
     pb.set_message(msg);
@@ -324,9 +324,10 @@ fn setup_duckdb(memory_mb_override: Option<u64>) -> Result<Connection> {
     conn.execute_batch(&format!(
         "PRAGMA threads={threads}; \
          SET memory_limit='{limit_mb}MB'; \
+         SET preserve_insertion_order=false; \
          CREATE TABLE ways (id BIGINT, frc INTEGER, fow INTEGER, direction INTEGER, node_ids BLOB); \
          CREATE TABLE restrictions_raw (from_way_id BIGINT, via_node_id BIGINT, to_way_id BIGINT); \
-         CREATE TABLE node_ref_deltas (node_id BIGINT, delta INTEGER); \
+         CREATE TABLE node_ref_deltas (node_id BIGINT, delta BIGINT); \
          CREATE TABLE node_coords (id BIGINT, lon DOUBLE, lat DOUBLE); \
          CREATE TABLE q_edges ( \
              edge_idx INTEGER, \
@@ -344,6 +345,21 @@ fn setup_duckdb(memory_mb_override: Option<u64>) -> Result<Connection> {
 }
 
 // ── Phase 1: Extract ways and relations ──────────────────────────────────────
+
+/// Compact `node_ref_deltas` in place: replace N rows with one row per unique
+/// node carrying the running delta sum.  Called periodically during pass 1 to
+/// keep the table bounded at ~COMPACT_INTERVAL × WAY_BATCH × avg_refs rows
+/// rather than growing to the full 300-400 M rows for continent-scale data.
+/// After the final compaction, `compute_derived_tables` only needs a cheap
+/// WHERE filter instead of a full GROUP BY on hundreds of millions of rows.
+fn compact_node_ref_deltas(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE _nrd_compact AS \
+             SELECT node_id, SUM(delta) AS delta FROM node_ref_deltas GROUP BY node_id; \
+         DROP TABLE node_ref_deltas; \
+         ALTER TABLE _nrd_compact RENAME TO node_ref_deltas;"
+    ).context("compact node_ref_deltas")
+}
 
 fn flush_way_batch(
     conn: &Connection,
@@ -397,6 +413,8 @@ fn extract_pass1(pbf_path: &Path, schema: &OsmSchemaMapping, conn: &Connection, 
     let mut delta_batch: Vec<(i64, i64)>     = Vec::with_capacity(WAY_BATCH * 12);
     let mut restriction_batch: Vec<(i64, i64, i64)> = Vec::with_capacity(8_192);
     let mut err: Option<anyhow::Error>        = None;
+    let mut batch_count: u64                  = 0;
+    const COMPACT_INTERVAL: u64               = 50;
 
     reader.for_each(|el| {
         if err.is_some() { return; }
@@ -464,7 +482,13 @@ fn extract_pass1(pbf_path: &Path, schema: &OsmSchemaMapping, conn: &Connection, 
 
                 if way_batch.len() >= WAY_BATCH {
                     if let Err(e) = flush_way_batch(conn, &mut way_batch, &mut delta_batch) {
-                        err = Some(e);
+                        err = Some(e); return;
+                    }
+                    batch_count += 1;
+                    if batch_count % COMPACT_INTERVAL == 0 {
+                        if let Err(e) = compact_node_ref_deltas(conn) {
+                            err = Some(e); return;
+                        }
                     }
                 }
             }
@@ -534,11 +558,13 @@ fn extract_pass1(pbf_path: &Path, schema: &OsmSchemaMapping, conn: &Connection, 
 
 fn compute_derived_tables(conn: &Connection, show_progress: bool) -> Result<usize> {
     let pb = make_spinner(show_progress, "Building intersection index");
+    // node_ref_deltas is already compacted (running sums) by compact_node_ref_deltas()
+    // called periodically during pass 1 — no GROUP BY needed here.
     conn.execute_batch(
         "CREATE TABLE intersection_nodes AS \
-             SELECT node_id FROM node_ref_deltas GROUP BY node_id HAVING SUM(delta) >= 2; \
+             SELECT node_id FROM node_ref_deltas WHERE delta >= 2; \
          CREATE TABLE unique_refs AS \
-             SELECT DISTINCT node_id FROM node_ref_deltas; \
+             SELECT node_id FROM node_ref_deltas; \
          CREATE INDEX idx_unique_refs ON unique_refs(node_id); \
          CREATE INDEX idx_intersection ON intersection_nodes(node_id);"
     )
