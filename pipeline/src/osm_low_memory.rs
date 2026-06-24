@@ -59,10 +59,6 @@ use crate::tile::{lon_lat_to_tile_xy, xyz_to_tile_id};
 
 /// Ways flushed to DuckDB per batch during Pass 1.
 const WAY_BATCH: usize = 5_000;
-/// Node-coord rows batched before DuckDB flush during Pass 2.
-const NODE_BATCH: usize = 200_000;
-/// Ways processed per adapt+split+quantize iteration.
-const ADAPT_BATCH: usize = 1_000;
 
 // ── Internal structs ──────────────────────────────────────────────────────────
 
@@ -715,40 +711,83 @@ fn apply_bbox_filter(bbox: Bbox, conn: &Connection, show_progress: bool) -> Resu
 
 // ── Phase 3: Adapt + split + quantize ─────────────────────────────────────────
 
-pub(crate) fn adapt_split_quantize(conn: &Connection, tile_zoom: u8, show_progress: bool) -> Result<usize> {
-    // Build indexes for fast coord and intersection lookups.
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_nc ON node_coords(id); \
-         CREATE INDEX IF NOT EXISTS idx_ic ON intersection_nodes(node_id);"
-    )
-    .context("create adapt indexes")?;
+pub(crate) fn adapt_split_quantize(conn: &Connection, tile_zoom: u8, duckdb_memory_mb: Option<u64>, show_progress: bool) -> Result<usize> {
+    // The heavy DuckDB operations (GROUP BY, index builds) are done by this point.
+    // Adapt only does sequential scans + Appender writes, so drop the buffer pool
+    // limit to 2 GB — freeing ~6 GB on a 32 GB machine before nc_map is allocated.
+    conn.execute_batch("SET memory_limit='2048MB';")
+        .context("lower DuckDB memory limit for adapt stage")?;
+
+    // Index for cursor-based way streaming (avoids O(N²) LIMIT/OFFSET scan).
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_ways_id ON ways(id);")
+        .context("create ways id index")?;
+
+    // Load intersection_nodes into a Rust HashSet — replaces per-batch DuckDB
+    // lookups that each build an IN-list query against the disk-backed table.
+    let ix_count: i64 = conn.query_row("SELECT COUNT(*) FROM intersection_nodes", [], |r| r.get(0))?;
+    let mut ix_nodes: HashSet<i64> = HashSet::with_capacity(ix_count as usize + 64);
+    {
+        let mut stmt = conn.prepare("SELECT node_id FROM intersection_nodes")
+            .context("prepare ix_nodes")?;
+        for row in stmt.query_map([], |r| r.get::<_, i64>(0))
+            .context("query ix_nodes")?
+        {
+            ix_nodes.insert(row?);
+        }
+    }
+    info!(count = ix_nodes.len(), "intersection nodes loaded into RAM");
+
+    // Load node_coords as quantized i32 pairs — replaces per-batch IN-list
+    // random reads against 338M rows on disk.  Storing as i32 (1e-7°) halves
+    // the per-entry size vs f64; we reconvert to f64 at use time (sub-cm error).
+    let nc_count: i64 = conn.query_row("SELECT COUNT(*) FROM node_coords", [], |r| r.get(0))?;
+    let mut nc_map: HashMap<i64, (i32, i32)> = HashMap::with_capacity(nc_count as usize + 64);
+    {
+        let mut stmt = conn.prepare("SELECT id, lon, lat FROM node_coords")
+            .context("prepare nc_map")?;
+        for row in stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?))
+        }).context("query nc_map")? {
+            let (id, lon, lat) = row?;
+            nc_map.insert(id, (quantize_coord(lon), quantize_coord(lat)));
+        }
+    }
+    info!(count = nc_map.len(), "node coords loaded into RAM");
 
     let way_count: i64 = conn.query_row("SELECT COUNT(*) FROM ways", [], |r| r.get(0))?;
     let pb = make_bar(show_progress, way_count as u64, "Adapt/split/quantize");
     let mut edge_idx: u32 = 0;
-    let mut offset: i64  = 0;
-
-    // Track unique nodes — deduplicate across batches via a local HashSet to avoid
-    // duplicate inserts (DuckDB has no INSERT OR IGNORE / ON CONFLICT DO NOTHING).
     let mut seen_nodes: HashSet<[u8; 16]> = HashSet::new();
 
-    while offset < way_count {
-        let batch = fetch_ways_batch(conn, offset, ADAPT_BATCH as i64)?;
+    // Appenders for bulk output — replaces per-edge/node conn.execute() calls.
+    let mut edge_app = conn.appender("q_edges").context("appender q_edges")?;
+    let mut node_app = conn.appender("q_nodes").context("appender q_nodes")?;
+
+    // Cursor-based streaming: WHERE id > last_id ORDER BY id LIMIT N.
+    // Each batch is O(log N + batch_size) with the index, not O(offset + batch_size).
+    const STREAM_BATCH: i64 = 50_000;
+    let mut last_id: i64 = i64::MIN;
+    let mut ways_done: i64 = 0;
+
+    loop {
+        let batch: Vec<WayRecord> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, frc, fow, direction, node_ids \
+                 FROM ways WHERE id > ? ORDER BY id LIMIT ?"
+            ).context("prepare ways cursor")?;
+            stmt.query_map(params![last_id, STREAM_BATCH], |r| Ok(WayRecord {
+                id:        r.get(0)?,
+                frc:       r.get::<_, i64>(1)? as u8,
+                fow:       r.get::<_, i64>(2)? as u8,
+                direction: r.get::<_, i64>(3)? as u8,
+                node_ids:  r.get::<_, Vec<u8>>(4)?,
+            }))
+            .context("query ways cursor")?
+            .collect::<duckdb::Result<Vec<_>>>()
+            .context("collect ways batch")?
+        };
         if batch.is_empty() { break; }
 
-        // Collect all node IDs referenced by this batch.
-        let all_node_ids: Vec<i64> = batch
-            .iter()
-            .flat_map(|w| blob_to_node_ids(&w.node_ids))
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        // Fetch coords and intersection flags for this node set.
-        let node_coords  = fetch_node_coords(conn, &all_node_ids)?;
-        let ix_nodes     = fetch_intersection_nodes(conn, &all_node_ids)?;
-
-        // Process each way.
         for way_row in &batch {
             let way_id    = way_row.id;
             let node_ids  = blob_to_node_ids(&way_row.node_ids);
@@ -761,7 +800,6 @@ pub(crate) fn adapt_split_quantize(conn: &Connection, tile_zoom: u8, show_progre
             let parent_gers = encode_way_id(way_id);
             let last = node_ids.len() - 1;
 
-            // Determine split points: index 0, any interior intersection node, last.
             let mut split_starts: Vec<usize> = vec![0];
             for (i, &nid) in node_ids[1..last].iter().enumerate() {
                 if ix_nodes.contains(&nid) {
@@ -772,87 +810,96 @@ pub(crate) fn adapt_split_quantize(conn: &Connection, tile_zoom: u8, show_progre
             for (k, &start_idx) in split_starts.iter().enumerate() {
                 let end_idx = if k + 1 < split_starts.len() { split_starts[k + 1] } else { last };
 
-                // Build geometry.
-                let mut geom_f64: Vec<(f64, f64)> = Vec::with_capacity(end_idx - start_idx + 1);
+                // Build geometry from preloaded map (no DuckDB round-trip).
+                let mut geom_q: Vec<(i32, i32)> = Vec::with_capacity(end_idx - start_idx + 1);
                 let mut ok = true;
                 for &nid in &node_ids[start_idx..=end_idx] {
-                    if let Some(&(lon, lat)) = node_coords.get(&nid) {
-                        geom_f64.push((lon, lat));
+                    if let Some(&c) = nc_map.get(&nid) {
+                        geom_q.push(c);
                     } else {
                         warn!(way = way_id, node = nid, "missing coords, sub-edge skipped");
                         ok = false;
                         break;
                     }
                 }
-                if !ok || geom_f64.len() < 2 { continue; }
+                if !ok || geom_q.len() < 2 { continue; }
+
+                // Compute length from f64 (reconvert quantized coords).
+                let geom_f64: Vec<(f64, f64)> = geom_q.iter()
+                    .map(|&(x, y)| (x as f64 * 1e-7, y as f64 * 1e-7))
+                    .collect();
+                let length_m  = polyline_length_m(&geom_f64);
+                let length_cm = (length_m * 100.0).round() as u32;
+
+                let geom_q    = remove_collinear_lm(geom_q);
+                let geom_blob = geom_to_blob(&geom_q);
 
                 let start_nid  = node_ids[start_idx];
                 let end_nid    = node_ids[end_idx];
                 let start_gers = encode_node_id(start_nid);
                 let end_gers   = encode_node_id(end_nid);
-                let length_m   = polyline_length_m(&geom_f64);
-                let length_cm  = (length_m * 100.0).round() as u32;
 
-                // Quantize geometry and remove collinear vertices.
-                let raw_q: Vec<(i32, i32)> = geom_f64
-                    .iter()
-                    .map(|&(lon, lat)| (quantize_coord(lon), quantize_coord(lat)))
-                    .collect();
-                let geom_q = remove_collinear_lm(raw_q);
-
-                // Tile key from midpoint.
                 let mid = geom_q[geom_q.len() / 2];
                 let (tile_x, tile_y) = lon_lat_to_tile_xy(
                     mid.0 as f64 * 1e-7, mid.1 as f64 * 1e-7, tile_zoom,
                 );
                 let tile_id = xyz_to_tile_id(tile_zoom, tile_x, tile_y);
 
-                let geom_blob = geom_to_blob(&geom_q);
-
-                conn.execute(
-                    "INSERT INTO q_edges VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    params![
-                        edge_idx as i64,
-                        start_gers.as_slice(), end_gers.as_slice(), parent_gers.as_slice(),
-                        geom_blob,
-                        length_cm as i64,
-                        frc as i64, fow as i64, direction as i64,
-                        tile_x as i64, tile_y as i64, tile_id as i64
-                    ],
-                )
-                .context("INSERT q_edge")?;
+                edge_app.append_row(params![
+                    edge_idx as i64,
+                    start_gers.as_slice(), end_gers.as_slice(), parent_gers.as_slice(),
+                    geom_blob, length_cm as i64,
+                    frc as i64, fow as i64, direction as i64,
+                    tile_x as i64, tile_y as i64, tile_id as i64
+                ]).context("append q_edge")?;
                 edge_idx += 1;
 
-                // Insert start and end nodes (deduplicated).
                 for (ngers, (nlon, nlat)) in [
-                    (start_gers, (geom_f64[0].0, geom_f64[0].1)),
-                    (end_gers,   (*geom_f64.last().unwrap())),
+                    (start_gers, geom_f64[0]),
+                    (end_gers,   *geom_f64.last().unwrap()),
                 ] {
-                    if !seen_nodes.contains(&ngers) {
-                        seen_nodes.insert(ngers);
+                    if seen_nodes.insert(ngers) {
                         let lon_e7 = quantize_coord(nlon);
                         let lat_e7 = quantize_coord(nlat);
                         let (ntx, nty) = lon_lat_to_tile_xy(nlon, nlat, tile_zoom);
-                        conn.execute(
-                            "INSERT INTO q_nodes VALUES (?,?,?,?,?)",
-                            params![
-                                ngers.as_slice(),
-                                lon_e7, lat_e7,
-                                ntx as i64, nty as i64
-                            ],
-                        )
-                        .context("INSERT q_node")?;
+                        node_app.append_row(params![
+                            ngers.as_slice(), lon_e7, lat_e7,
+                            ntx as i64, nty as i64
+                        ]).context("append q_node")?;
                     }
                 }
             }
         }
 
-        let batch_len = batch.len() as i64;
-        offset += batch_len;
-        pb.inc(batch_len as u64);
-        if offset % 50_000 == 0 {
-            info!(progress = offset, way_count, edges = edge_idx, "adapt+split progress");
+        last_id   = batch.last().unwrap().id;
+        ways_done += batch.len() as i64;
+        pb.inc(batch.len() as u64);
+        if ways_done % 500_000 == 0 {
+            info!(progress = ways_done, way_count, edges = edge_idx, "adapt+split progress");
         }
+    }
+
+    edge_app.flush().context("flush q_edges")?;
+    node_app.flush().context("flush q_nodes")?;
+    drop(edge_app);
+    drop(node_app);
+
+    // Free the large maps, then restore the DuckDB memory limit to whatever the
+    // user requested.  The checkpoint DuckDB runs before building indexes needs
+    // the same headroom that earlier passes used — it has to flush all Appender
+    // WAL data (70M+ edge rows) to disk in one pass.
+    drop(ix_nodes);
+    drop(nc_map);
+    {
+        let restore_mb = match duckdb_memory_mb {
+            Some(mb) => mb,
+            None => {
+                let avail = available_ram_bytes();
+                ((avail as f64 * 0.40) / 1_048_576.0) as u64
+            }
+        };
+        conn.execute_batch(&format!("SET memory_limit='{restore_mb}MB';"))
+            .context("restore DuckDB memory limit before index build")?;
     }
 
     // Resolve restrictions from OSM.
@@ -891,48 +938,6 @@ pub(crate) fn adapt_split_quantize(conn: &Connection, tile_zoom: u8, show_progre
     Ok(edge_idx as usize)
 }
 
-fn fetch_ways_batch(conn: &Connection, offset: i64, limit: i64) -> Result<Vec<WayRecord>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, frc, fow, direction, node_ids FROM ways LIMIT ? OFFSET ?"
-    )?;
-    let rows = stmt
-        .query_map(params![limit, offset], |r| {
-            Ok(WayRecord {
-                id:        r.get(0)?,
-                frc:       r.get::<_, i64>(1)? as u8,
-                fow:       r.get::<_, i64>(2)? as u8,
-                direction: r.get::<_, i64>(3)? as u8,
-                node_ids:  r.get::<_, Vec<u8>>(4)?,
-            })
-        })?
-        .collect::<duckdb::Result<Vec<_>>>()
-        .context("fetch_ways_batch")?;
-    Ok(rows)
-}
-
-fn fetch_node_coords(conn: &Connection, ids: &[i64]) -> Result<HashMap<i64, (f64, f64)>> {
-    if ids.is_empty() { return Ok(HashMap::new()); }
-    let ids_str = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
-    let sql = format!("SELECT id, lon, lat FROM node_coords WHERE id IN ({})", ids_str);
-    let mut stmt = conn.prepare(&sql)?;
-    let map = stmt
-        .query_map([], |r| Ok((r.get::<_, i64>(0)?, (r.get(1)?, r.get(2)?))))?
-        .collect::<duckdb::Result<HashMap<i64, (f64, f64)>>>()
-        .context("fetch_node_coords")?;
-    Ok(map)
-}
-
-fn fetch_intersection_nodes(conn: &Connection, ids: &[i64]) -> Result<HashSet<i64>> {
-    if ids.is_empty() { return Ok(HashSet::new()); }
-    let ids_str = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
-    let sql = format!("SELECT node_id FROM intersection_nodes WHERE node_id IN ({})", ids_str);
-    let mut stmt = conn.prepare(&sql)?;
-    let set = stmt
-        .query_map([], |r| r.get(0))?
-        .collect::<duckdb::Result<HashSet<i64>>>()
-        .context("fetch_intersection_nodes")?;
-    Ok(set)
-}
 
 /// Lossless collinear-vertex removal (mirror of quantize::remove_collinear).
 pub(crate) fn remove_collinear_lm(pts: Vec<(i32, i32)>) -> Vec<(i32, i32)> {
@@ -1319,7 +1324,7 @@ pub fn run_pipeline(
 
     // Phase 3: adapt + split + quantize.
     info!("low-memory: adapt + split + quantize");
-    adapt_split_quantize(&conn, tile_zoom, show_progress)?;
+    adapt_split_quantize(&conn, tile_zoom, duckdb_memory_mb, show_progress)?;
 
     // Phase 4: tile and write PMTiles.
     info!("low-memory: tiling");
