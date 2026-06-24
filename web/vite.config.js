@@ -69,7 +69,7 @@ export default defineConfig({
         serveTile(tilesDir, req, res);
       });
 
-      srv.listen(TILE_SERVER_PORT, '127.0.0.1', () => {
+      srv.listen(TILE_SERVER_PORT, '0.0.0.0', () => {
         console.log(`  ➜  Tiles:   http://localhost:${TILE_SERVER_PORT}/`);
       });
     },
