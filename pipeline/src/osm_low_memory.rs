@@ -540,17 +540,42 @@ fn extract_pass1(pbf_path: &Path, schema: &OsmSchemaMapping, conn: &Connection, 
 
 fn compute_derived_tables(conn: &Connection, show_progress: bool) -> Result<usize> {
     let pb = make_spinner(show_progress, "Building intersection index");
-    // node_ref_deltas holds raw (node_id, delta) rows; DuckDB spills the GROUP BY
-    // to disk (temp_directory set in setup_duckdb) if memory is insufficient.
+
+    // A single GROUP BY over all ~100-150M unique node_ids needs a ~6-8 GB hash
+    // table, which exhausts the 8 GB memory limit even with file-backed storage.
+    // Solution: partition by node_id % CHUNKS.  Each chunk's hash table covers
+    // only 1/CHUNKS of the unique keys (~750 MB at CHUNKS=8) — well within budget.
+    // Each chunk does one full scan of node_ref_deltas (on disk); CHUNKS=8 means
+    // 8 sequential scans, fast on any SSD.
+    const CHUNKS: i64 = 8;
+
     conn.execute_batch(
-        "CREATE TABLE intersection_nodes AS \
-             SELECT node_id FROM node_ref_deltas GROUP BY node_id HAVING SUM(delta) >= 2; \
-         CREATE TABLE unique_refs AS \
-             SELECT DISTINCT node_id FROM node_ref_deltas; \
-         CREATE INDEX idx_unique_refs ON unique_refs(node_id); \
-         CREATE INDEX idx_intersection ON intersection_nodes(node_id);"
-    )
-    .context("compute derived tables")?;
+        "CREATE TABLE intersection_nodes (node_id BIGINT); \
+         CREATE TABLE unique_refs (node_id BIGINT);"
+    ).context("create derived tables")?;
+
+    for chunk in 0..CHUNKS {
+        if show_progress {
+            pb.set_message(format!("Building intersection index ({}/{})", chunk + 1, CHUNKS));
+        }
+        conn.execute_batch(&format!(
+            // One scan builds a temp aggregate for this partition, then we split
+            // it into the two output tables without a second scan.
+            "CREATE TEMP TABLE _agg AS \
+                 SELECT node_id, SUM(delta) AS total \
+                 FROM node_ref_deltas WHERE node_id % {CHUNKS} = {chunk} \
+                 GROUP BY node_id; \
+             INSERT INTO unique_refs        SELECT node_id FROM _agg; \
+             INSERT INTO intersection_nodes SELECT node_id FROM _agg WHERE total >= 2; \
+             DROP TABLE _agg;"
+        )).with_context(|| format!("compute derived tables chunk {chunk}/{CHUNKS}"))?;
+    }
+
+    conn.execute_batch(
+        "CREATE INDEX idx_unique_refs    ON unique_refs(node_id); \
+         CREATE INDEX idx_intersection   ON intersection_nodes(node_id);"
+    ).context("create derived indexes")?;
+
     pb.finish_and_clear();
 
     let ix_count: i64 = conn
