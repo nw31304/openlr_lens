@@ -82,9 +82,6 @@ struct EdgeBatch {
     frc:        u8,
     fow:        u8,
     direction:  u8,
-    tile_x:     u32,
-    tile_y:     u32,
-    tile_id:    u64,
 }
 
 // ── Feature parsing ───────────────────────────────────────────────────────────
@@ -101,7 +98,6 @@ fn map_flowdir(flowdir: i64) -> u8 {
 /// Returns None for blank lines or degenerate geometry (< 2 vertices).
 fn parse_line(
     line: &str,
-    tile_zoom: u8,
     seg_to_to_int: &mut std::collections::HashMap<i64, i64>,
 ) -> Result<Option<EdgeBatch>> {
     let v: Value = serde_json::from_str(line).context("JSON parse")?;
@@ -159,26 +155,17 @@ fn parse_line(
         return Ok(None);
     }
 
-    // Tile placement uses the edge midpoint.
-    let mid_idx = float_geom.len() / 2;
-    let (mid_lon, mid_lat) = float_geom[mid_idx];
-    let (tile_x, tile_y) = lon_lat_to_tile_xy(mid_lon, mid_lat, tile_zoom);
-    let tile_id = crate::tile::xyz_to_tile_id(tile_zoom, tile_x, tile_y);
-
     seg_to_to_int.insert(id, to_int);
 
     Ok(Some(EdgeBatch {
-        start_gers: node_gers(from_int),
-        end_gers:   node_gers(to_int),
+        start_gers:  node_gers(from_int),
+        end_gers:    node_gers(to_int),
         parent_gers: segment_gers(id),
         geom,
         length_cm,
-        frc:        frc_raw.clamp(0, 7) as u8,
-        fow:        fow_raw.clamp(0, 7) as u8,
-        direction:  map_flowdir(flowdir),
-        tile_x,
-        tile_y,
-        tile_id,
+        frc:       frc_raw.clamp(0, 7) as u8,
+        fow:       fow_raw.clamp(0, 7) as u8,
+        direction: map_flowdir(flowdir),
     }))
 }
 
@@ -210,36 +197,53 @@ fn process_geojsonl_file(
         let line = line.trim();
         if line.is_empty() { continue; }
 
-        match parse_line(line, tile_zoom, seg_to_to_int) {
+        match parse_line(line, seg_to_to_int) {
             Ok(Some(e)) => {
+                let (slon_e7, slat_e7) = e.geom[0];
+                let (elon_e7, elat_e7) = *e.geom.last().unwrap();
+
                 if seen_nodes.insert(e.start_gers) {
-                    let (lon_e7, lat_e7) = (e.geom[0].0, e.geom[0].1);
                     let (tx, ty) = lon_lat_to_tile_xy(
-                        lon_e7 as f64 / 1e7, lat_e7 as f64 / 1e7, tile_zoom,
+                        slon_e7 as f64 / 1e7, slat_e7 as f64 / 1e7, tile_zoom,
                     );
                     node_app.append_row(params![
-                        &e.start_gers[..], lon_e7, lat_e7, tx as i64, ty as i64
+                        &e.start_gers[..], slon_e7, slat_e7, tx as i64, ty as i64
                     ]).context("append q_node")?;
                 }
                 if seen_nodes.insert(e.end_gers) {
-                    let last = *e.geom.last().unwrap();
-                    let (lon_e7, lat_e7) = (last.0, last.1);
                     let (tx, ty) = lon_lat_to_tile_xy(
-                        lon_e7 as f64 / 1e7, lat_e7 as f64 / 1e7, tile_zoom,
+                        elon_e7 as f64 / 1e7, elat_e7 as f64 / 1e7, tile_zoom,
                     );
                     node_app.append_row(params![
-                        &e.end_gers[..], lon_e7, lat_e7, tx as i64, ty as i64
+                        &e.end_gers[..], elon_e7, elat_e7, tx as i64, ty as i64
                     ]).context("append q_node")?;
                 }
 
+                let (stx, sty) = lon_lat_to_tile_xy(
+                    slon_e7 as f64 / 1e7, slat_e7 as f64 / 1e7, tile_zoom,
+                );
+                let (etx, ety) = lon_lat_to_tile_xy(
+                    elon_e7 as f64 / 1e7, elat_e7 as f64 / 1e7, tile_zoom,
+                );
                 let geom_blob = geom_to_blob(&e.geom);
                 edge_app.append_row(params![
                     *edge_idx as i64,
                     &e.start_gers[..], &e.end_gers[..], &e.parent_gers[..],
-                    geom_blob, e.length_cm as i64,
+                    geom_blob.as_slice(), e.length_cm as i64,
                     e.frc as i64, e.fow as i64, e.direction as i64,
-                    e.tile_x as i64, e.tile_y as i64, e.tile_id as i64,
-                ]).context("append q_edge")?;
+                    stx as i64, sty as i64,
+                    crate::tile::xyz_to_tile_id(tile_zoom, stx, sty) as i64,
+                ]).context("append q_edge start-tile")?;
+                if (etx, ety) != (stx, sty) {
+                    edge_app.append_row(params![
+                        *edge_idx as i64,
+                        &e.start_gers[..], &e.end_gers[..], &e.parent_gers[..],
+                        geom_blob.as_slice(), e.length_cm as i64,
+                        e.frc as i64, e.fow as i64, e.direction as i64,
+                        etx as i64, ety as i64,
+                        crate::tile::xyz_to_tile_id(tile_zoom, etx, ety) as i64,
+                    ]).context("append q_edge end-tile")?;
+                }
                 *edge_idx += 1;
                 pb.inc(1);
             }

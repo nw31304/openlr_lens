@@ -173,7 +173,9 @@ fn build_lm_tile_payload(
     node_order: &[[u8; 16]],
     node_index: &HashMap<[u8; 16], u32>,
     node_lookup: &HashMap<[u8; 16], (i32, i32)>,
-    boundary_nodes: &HashSet<[u8; 16]>,
+    node_to_tile: &HashMap<[u8; 16], (u32, u32)>,
+    tile_x: u32,
+    tile_y: u32,
     intra: &[LmIntraTile],
     cross: &[LmCrossTile],
 ) -> Vec<u8> {
@@ -238,7 +240,7 @@ fn build_lm_tile_payload(
             warn!(gers = %hex::encode(gers), "node not found in lookup");
             (0, 0)
         });
-        let is_boundary = boundary_nodes.contains(gers);
+        let is_boundary = node_to_tile.get(gers) != Some(&(tile_x, tile_y));
         payload.extend_from_slice(&lon_e7.to_le_bytes());
         payload.extend_from_slice(&lat_e7.to_le_bytes());
         payload.extend_from_slice(gers.as_slice());
@@ -838,19 +840,29 @@ pub(crate) fn adapt_split_quantize(conn: &Connection, tile_zoom: u8, duckdb_memo
                 let start_gers = encode_node_id(start_nid);
                 let end_gers   = encode_node_id(end_nid);
 
-                let mid = geom_q[geom_q.len() / 2];
-                let (tile_x, tile_y) = lon_lat_to_tile_xy(
-                    mid.0 as f64 * 1e-7, mid.1 as f64 * 1e-7, tile_zoom,
+                // Assign to the tile of the start node, and also to the tile of the
+                // end node if different.  This ensures A* can always find all segments
+                // incident to a node by loading that node's home tile.
+                let (stx, sty) = lon_lat_to_tile_xy(geom_f64[0].0, geom_f64[0].1, tile_zoom);
+                let (etx, ety) = lon_lat_to_tile_xy(
+                    geom_f64.last().unwrap().0, geom_f64.last().unwrap().1, tile_zoom,
                 );
-                let tile_id = xyz_to_tile_id(tile_zoom, tile_x, tile_y);
-
                 edge_app.append_row(params![
                     edge_idx as i64,
                     start_gers.as_slice(), end_gers.as_slice(), parent_gers.as_slice(),
-                    geom_blob, length_cm as i64,
+                    geom_blob.as_slice(), length_cm as i64,
                     frc as i64, fow as i64, direction as i64,
-                    tile_x as i64, tile_y as i64, tile_id as i64
-                ]).context("append q_edge")?;
+                    stx as i64, sty as i64, xyz_to_tile_id(tile_zoom, stx, sty) as i64
+                ]).context("append q_edge start-tile")?;
+                if (etx, ety) != (stx, sty) {
+                    edge_app.append_row(params![
+                        edge_idx as i64,
+                        start_gers.as_slice(), end_gers.as_slice(), parent_gers.as_slice(),
+                        geom_blob.as_slice(), length_cm as i64,
+                        frc as i64, fow as i64, direction as i64,
+                        etx as i64, ety as i64, xyz_to_tile_id(tile_zoom, etx, ety) as i64
+                    ]).context("append q_edge end-tile")?;
+                }
                 edge_idx += 1;
 
                 for (ngers, (nlon, nlat)) in [
@@ -983,9 +995,8 @@ pub(crate) fn tile_from_duckdb(
     }
     info!(nodes = node_lookup.len(), "node_lookup loaded");
 
-    // ── Scan edge metadata to build boundary_nodes, edge maps, tile count ───────
+    // ── Scan edge metadata to build edge maps and tile count ─────────────────────
     let mut seen_tile_ids: HashSet<u64>  = HashSet::new();
-    let mut node_tile_id: HashMap<[u8; 16], u64> = HashMap::new(); // gers → first tile_id seen (u64::MAX = boundary)
     let mut from_edge_map: HashMap<([u8; 16], [u8; 16]), u32> = HashMap::new();
     let mut to_edge_map:   HashMap<([u8; 16], [u8; 16]), u32> = HashMap::new();
     {
@@ -1006,29 +1017,16 @@ pub(crate) fn tile_from_duckdb(
 
             seen_tile_ids.insert(tile_id);
 
-            // Boundary node detection: node is boundary if it appears in 2+ different tiles.
-            for gers in [start_gers, end_gers] {
-                let entry = node_tile_id.entry(gers).or_insert(tile_id);
-                if *entry != tile_id { *entry = u64::MAX; } // sentinel: boundary
-            }
-
+            // Same edge may appear twice (start tile + end tile); HashMap insert is
+            // idempotent here since both rows carry identical (parent_gers, end/start_gers).
             from_edge_map.insert((parent_gers, end_gers),   edge_idx);
             to_edge_map.insert(  (parent_gers, start_gers), edge_idx);
         }
     }
     let total_tiles = seen_tile_ids.len();
     drop(seen_tile_ids);
-    let boundary_nodes: HashSet<[u8; 16]> = node_tile_id
-        .into_iter()
-        .filter(|(_, v)| *v == u64::MAX)
-        .map(|(k, _)| k)
-        .collect();
 
-    info!(
-        tiles          = total_tiles,
-        boundary_nodes = boundary_nodes.len(),
-        "tile metadata scanned"
-    );
+    info!(tiles = total_tiles, "tile metadata scanned");
 
     // ── Resolve restrictions ──────────────────────────────────────────────────
     let mut resolved: Vec<ResolvedRestriction> = Vec::new();
@@ -1116,7 +1114,7 @@ pub(crate) fn tile_from_duckdb(
             if let Some((cx, cy, cid)) = cur_tile {
                 if (tile_x, tile_y) != (cx, cy) {
                     flush_tile(cid, cx, cy, &cur_edges,
-                               &node_lookup, &boundary_nodes, &tile_restrictions,
+                               &node_lookup, &node_to_tile, &tile_restrictions,
                                &mut writer)?;
                     cur_edges.clear();
                     done_tiles += 1;
@@ -1139,7 +1137,7 @@ pub(crate) fn tile_from_duckdb(
         if let Some((cx, cy, cid)) = cur_tile {
             if !cur_edges.is_empty() {
                 flush_tile(cid, cx, cy, &cur_edges,
-                           &node_lookup, &boundary_nodes, &tile_restrictions,
+                           &node_lookup, &node_to_tile, &tile_restrictions,
                            &mut writer)?;
                 done_tiles += 1;
                 pb.inc(1);
@@ -1162,7 +1160,7 @@ fn flush_tile(
     tile_y: u32,
     edges: &[LmEdge],
     node_lookup: &HashMap<[u8; 16], (i32, i32)>,
-    boundary_nodes: &HashSet<[u8; 16]>,
+    node_to_tile: &HashMap<[u8; 16], (u32, u32)>,
     tile_restrictions: &HashMap<(u32, u32), Vec<&ResolvedRestriction>>,
     writer: &mut StreamingWriter,
 ) -> Result<()> {
@@ -1206,7 +1204,7 @@ fn flush_tile(
 
     let payload = build_lm_tile_payload(
         edges, &node_order, &node_index,
-        node_lookup, boundary_nodes, &intra, &cross,
+        node_lookup, node_to_tile, tile_x, tile_y, &intra, &cross,
     );
     writer.add_tile(tile_id, &payload).context("add_tile")?;
     Ok(())
