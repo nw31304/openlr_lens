@@ -112,7 +112,7 @@ function ReferenceSection({ decodeResult, onLrpClick }) {
               <RefRow label="FRC"     helpKey="frc"
                 value={FRC_LABEL[lrp.frc] ?? `FRC${lrp.frc}`} />
               <RefRow label="FOW"     helpKey="fow"
-                value={FOW_LABEL[lrp.fow] ?? lrp.fow} />
+                value={FOW_LABEL[lrp.fow] != null ? `FOW${lrp.fow} · ${FOW_LABEL[lrp.fow]}` : `FOW${lrp.fow}`} />
               <RefRow label="Bearing" helpKey="bearing"
                 value={fmtBearing(lrp.bearing_lb, lrp.bearing_ub)} />
               {!isLast && dnpStr &&
