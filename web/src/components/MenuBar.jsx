@@ -16,10 +16,12 @@ export default function MenuBar() {
     decoding,
   } = useStore();
 
-  const [showTileMenu, setShowTileMenu] = useState(false);
-  const [urlDraft, setUrlDraft]         = useState('');
-  const tileMenuRef = useRef(null);
-  const traceLevel  = params?.trace_level ?? 'Summary';
+  const [showTileMenu,  setShowTileMenu]  = useState(false);
+  const [showTraceMenu, setShowTraceMenu] = useState(false);
+  const [urlDraft, setUrlDraft]           = useState('');
+  const tileMenuRef  = useRef(null);
+  const traceMenuRef = useRef(null);
+  const traceLevel   = params?.trace_level ?? 'Summary';
 
   // Sync urlDraft with the active tile URL whenever the menu opens.
   useEffect(() => {
@@ -36,6 +38,17 @@ export default function MenuBar() {
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
   }, [showTileMenu]);
+
+  // Close trace menu on outside click.
+  useEffect(() => {
+    if (!showTraceMenu) return;
+    const handler = (e) => {
+      if (traceMenuRef.current && !traceMenuRef.current.contains(e.target))
+        setShowTraceMenu(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [showTraceMenu]);
 
   function applyTileUrl() {
     const trimmed = urlDraft.trim();
@@ -76,22 +89,33 @@ export default function MenuBar() {
         >Results</button>
       )}
 
-      <div className="menu-divider" />
-
-      <span className="menu-label">Trace:</span>
-      {TRACE_LEVELS.map(lvl => (
-        <button
-          key={lvl}
-          className={`menu-level-btn${traceLevel === lvl ? ' active' : ''}`}
-          onClick={() => setTraceLevel(lvl)}
-        >{lvl}</button>
-      ))}
-
       <div className="menu-spacer" />
 
       <button className="menu-btn" onClick={toggleParams} title="Decode parameters">
         Parameters
       </button>
+
+      {/* Trace level dropdown */}
+      <div className="menu-tile-wrap" ref={traceMenuRef}>
+        <button
+          className={`menu-btn${showTraceMenu ? ' active' : ''}`}
+          onClick={() => setShowTraceMenu(v => !v)}
+          title="Trace detail level"
+        >Trace Level</button>
+
+        {showTraceMenu && (
+          <div className="menu-tile-dropdown menu-trace-dropdown">
+            <div className="menu-tile-label">Trace detail level</div>
+            {TRACE_LEVELS.map(lvl => (
+              <button
+                key={lvl}
+                className={`menu-trace-opt${traceLevel === lvl ? ' active' : ''}`}
+                onClick={() => { setTraceLevel(lvl); setShowTraceMenu(false); }}
+              >{lvl}</button>
+            ))}
+          </div>
+        )}
+      </div>
 
       {llmConfig && (
         <button

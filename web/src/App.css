@@ -29,7 +29,7 @@ html, body, #root, .app {
   border-bottom: 1px solid #252535;
   z-index: 50;
   white-space: nowrap;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .menu-title {
@@ -50,12 +50,6 @@ html, body, #root, .app {
 
 .menu-spacer { flex: 1 1 0; }
 
-.menu-label {
-  font-size: 11px;
-  color: #666;
-  flex-shrink: 0;
-}
-
 .menu-btn {
   background: transparent;
   border: 1px solid transparent;
@@ -74,24 +68,6 @@ html, body, #root, .app {
   background: rgba(0,212,255,0.08);
 }
 .menu-btn.configured { color: #6ee98f; }
-
-.menu-level-btn {
-  background: transparent;
-  border: 1px solid transparent;
-  color: #666;
-  border-radius: 4px;
-  padding: 2px 7px;
-  font-size: 11px;
-  cursor: pointer;
-  flex-shrink: 0;
-  transition: color 0.12s, background 0.12s;
-}
-.menu-level-btn:hover { color: #aaa; background: rgba(255,255,255,0.05); }
-.menu-level-btn.active {
-  color: #f8c300;
-  border-color: rgba(248,195,0,0.35);
-  background: rgba(248,195,0,0.08);
-}
 
 /* Tile source dropdown */
 .menu-tile-wrap { position: relative; flex-shrink: 0; }
@@ -144,6 +120,25 @@ html, body, #root, .app {
   padding: 2px 0;
 }
 .menu-tile-action:hover { color: #e8e8f0; }
+
+.menu-trace-dropdown { min-width: 140px; }
+.menu-trace-opt {
+  background: none;
+  border: 1px solid transparent;
+  color: #aaa;
+  border-radius: 5px;
+  padding: 5px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+  transition: color 0.12s, background 0.12s, border-color 0.12s;
+}
+.menu-trace-opt:hover { color: #e8e8f0; background: rgba(255,255,255,0.06); }
+.menu-trace-opt.active {
+  color: #f8c300;
+  border-color: rgba(248,195,0,0.35);
+  background: rgba(248,195,0,0.08);
+}
 
 /* Workspace row */
 .workspace {
