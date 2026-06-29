@@ -419,7 +419,7 @@ function RoutingSection({ leg, phase, fromCandidate, toCandidate, setTraceHighli
 
   return (
     <Section
-      title={`Routing — Leg ${leg}`}
+      title={`Routing — Leg ${leg + 1}`}
       badge={found ? 'found' : 'failed'}
       badgeOk={found}
       defaultOpen={true}
@@ -458,7 +458,7 @@ function RoutingSection({ leg, phase, fromCandidate, toCandidate, setTraceHighli
           <span className="tp-dim">Path </span>
           <button
             className="tp-seg-btn"
-            onClick={() => setTraceHighlight(result.path)}
+            onClick={() => setTraceHighlight(result.path, result.from_snap && result.to_snap ? { from: result.from_snap, to: result.to_snap } : null)}
             title="Highlight all path segments"
           >
             [{result.path.length} segs]

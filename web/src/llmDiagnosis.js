@@ -199,6 +199,28 @@ export function buildDiagnosticPrompt(decodeResult, params) {
     }
   }
 
+  // Offset overflow: combined offsets must not reach or exceed the decoded path length.
+  // This can only be checked in JS because the Rust engine now rejects such references
+  // before returning ok:true, but older results or edge cases may slip through.
+  if (decodeResult.ok) {
+    const pathTotalM = (decodeResult.segments ?? []).reduce((sum, s) => sum + (s.length_m ?? 0), 0);
+    const posLb = decodeResult.pos_offset_lb ?? 0;
+    const negLb = decodeResult.neg_offset_lb ?? 0;
+    const posUb = decodeResult.pos_offset_ub ?? 0;
+    const negUb = decodeResult.neg_offset_ub ?? 0;
+    if ((posLb > 0 || negLb > 0) && posLb + negLb >= pathTotalM) {
+      signals.push(
+        `OFFSET OVERFLOW: combined offsets (${posLb.toFixed(0)}+${negLb.toFixed(0)} = ${(posLb + negLb).toFixed(0)} m) ` +
+        `≥ path length (${pathTotalM.toFixed(0)} m) — trimmed location has zero or negative length; reference is malformed`
+      );
+    } else if ((posUb > 0 || negUb > 0) && posUb + negUb >= pathTotalM) {
+      signals.push(
+        `OFFSET WARNING: combined offset upper bounds (${posUb.toFixed(0)}+${negUb.toFixed(0)} = ${(posUb + negUb).toFixed(0)} m) ` +
+        `≥ path length (${pathTotalM.toFixed(0)} m) — trimmed location may be zero-length`
+      );
+    }
+  }
+
   // Adjacent LRP proximity (encoded coordinates)
   for (let i = 0; i < (decodeResult.lrps?.length ?? 0) - 1; i++) {
     const a = decodeResult.lrps[i], b = decodeResult.lrps[i + 1];

@@ -835,6 +835,33 @@ html, body, #root, .app {
 }
 .llm-chat-clear:hover { color: #aabbcc; }
 
+.llm-tool-strip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  background: rgba(255,255,255,0.03);
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  font-size: 10px;
+  color: rgba(255,255,255,0.35);
+  white-space: nowrap;
+  overflow: hidden;
+  cursor: default;
+  user-select: none;
+}
+.llm-tool-strip:hover { color: rgba(255,255,255,0.55); }
+.llm-tool-strip-icon { flex-shrink: 0; font-size: 9px; }
+.llm-tool-strip-calls {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: monospace;
+}
+.llm-tool-strip-bytes {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
 .llm-chat-body {
   flex: 1;
   overflow-y: auto;

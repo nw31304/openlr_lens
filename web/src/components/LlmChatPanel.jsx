@@ -30,9 +30,16 @@ const STRUCTURED_PROMPTS = new Set([
   ...SUGGESTED_OK,
 ]);
 
+function fmtBytes(n) {
+  if (n < 1000) return `${n} B`;
+  if (n < 1_000_000) return `${(n / 1000).toFixed(1)} kB`;
+  return `${(n / 1_000_000).toFixed(1)} MB`;
+}
+
 export default function LlmChatPanel() {
   const { llmChatOpen, toggleLlmChat, llmMessages, llmLoading,
-          sendLlmMessage, clearLlmChat, llmConfig, decodeResult } = useStore();
+          sendLlmMessage, clearLlmChat, llmConfig, decodeResult,
+          llmLastToolActivity } = useStore();
   const [draft, setDraft] = useState('');
   const bottomRef = useRef(null);
   const panelRef  = useRef(null);
@@ -73,6 +80,23 @@ export default function LlmChatPanel() {
           <button className="seg-info-close" onClick={toggleLlmChat} title="Close">✕</button>
         </div>
       </div>
+
+      {llmLastToolActivity && (
+        <div
+          className="llm-tool-strip"
+          title={llmLastToolActivity.calls.map(c =>
+            `${c.label}  ↑${fmtBytes(c.args_bytes)} ↓${fmtBytes(c.result_bytes)}`
+          ).join('\n')}
+        >
+          <span className="llm-tool-strip-icon">⚙</span>
+          <span className="llm-tool-strip-calls">
+            {llmLastToolActivity.calls.map(c => c.label).join(' · ')}
+          </span>
+          <span className="llm-tool-strip-bytes">
+            ↓{fmtBytes(llmLastToolActivity.total_result_bytes)}
+          </span>
+        </div>
+      )}
 
       <div className="llm-chat-body">
         {isEmpty && (

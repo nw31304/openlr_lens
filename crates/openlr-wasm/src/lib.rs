@@ -39,7 +39,8 @@ extern "C" {
 use openlr_codec::{decode_v3_base64, decode_tpeg_hex, decode_tpeg_base64};
 use openlr_codec::lrp::{LocationReference, LocationType, Orientation, SideOfRoad};
 use openlr_engine::{decode as engine_decode, DecodeError, DecodeParams, Preset, prefetch_tile_keys, path_to_wkt, path_band_wkt};
-use openlr_graph::{polyline_length_m, Direction};
+use openlr_graph::{SegmentId, NodeId};
+use openlr_graph::{polyline_length_m, haversine_m, Direction};
 use openlr_engine::trace::TraversalDir;
 use openlr_provider::TileLoader;
 use serde::Serialize;
@@ -312,6 +313,14 @@ impl Decoder {
                         needs_tile: [tk.z as u32, tk.x, tk.y],
                     }).unwrap();
                 }
+                // For OffsetOverflow the route was fully found; carry the path so the JS
+                // diagnostic layer can still access per-segment lengths.
+                let overflow_path: Option<Vec<SegmentId>> =
+                    if let DecodeError::OffsetOverflow { ref path, .. } = failure.error {
+                        Some(path.clone())
+                    } else {
+                        None
+                    };
                 let error_str = failure.error.to_string();
                 let trace_value = failure.trace.and_then(|t| {
                     // Fast path: serialise the whole trace at once.
@@ -336,10 +345,42 @@ impl Decoder {
                         "params": params_val,
                     })).ok()
                 });
+                // For OffsetOverflow: build segments from the routed path so the JS
+                // diagnostic layer can access per-segment lengths even though ok=false.
+                let overflow_segments: Vec<SegmentInfo> = overflow_path
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter_map(|seg_id| {
+                        self.loader.graph.segments.get(seg_id).map(|seg| {
+                            let (tile, local_index) = self.loader.seg_tile.get(seg_id)
+                                .map(|&(z, x, y, li)| (format!("{z}/{x}/{y}"), li))
+                                .unwrap_or_else(|| ("unknown".to_string(), 0));
+                            SegmentInfo {
+                                frc: seg.frc,
+                                fow: seg.fow,
+                                direction: match seg.direction {
+                                    Direction::Both     => "Both",
+                                    Direction::Forward  => "Forward",
+                                    Direction::Backward => "Backward",
+                                },
+                                length_m: (seg.length_m * 10.0).round() / 10.0,
+                                osm_way_id: seg.osm_way_id(),
+                                tile,
+                                local_index,
+                                segment_id: seg_id.0,
+                                geometry: seg.geometry.iter()
+                                    .map(|&(lon, lat)| [lon, lat])
+                                    .collect(),
+                            }
+                        })
+                    })
+                    .collect();
                 let full_result = DecodeResult {
                     lrps: lrp_info_vec(&loc_ref.lrps, &[], &[], &[]),
                     format: self.openlr_format.to_string(),
                     trace: trace_value,
+                    segments: overflow_segments,
                     ..DecodeResult::err(&error_str)
                 };
                 return match serde_json::to_string(&full_result) {
@@ -565,6 +606,245 @@ impl Decoder {
     pub fn loaded_node_count(&self) -> usize {
         self.loader.graph.nodes.len()
     }
+
+    // ── LLM diagnostic tool methods ───────────────────────────────────────────
+
+    /// Return full attributes + geometry for one segment by its graph segment ID.
+    /// Returns `{"error": "..."}` if the segment is not in the loaded tile set.
+    pub fn get_segment(&self, segment_id: u32) -> String {
+        let seg_id = SegmentId(segment_id);
+        match self.loader.graph.segments.get(&seg_id) {
+            None => serde_json::json!({
+                "error": format!("segment {} not found in loaded tiles", segment_id)
+            }).to_string(),
+            Some(seg) => {
+                let (tile, local_index) = self.loader.seg_tile.get(&seg_id)
+                    .map(|&(z, x, y, li)| (format!("{z}/{x}/{y}"), li))
+                    .unwrap_or_else(|| ("unknown".to_string(), 0));
+                serde_json::json!({
+                    "segment_id": segment_id,
+                    "source_key": segment_source_key(&seg.stable_id),
+                    "frc": seg.frc,
+                    "fow": seg.fow,
+                    "direction": match seg.direction {
+                        Direction::Both     => "Both",
+                        Direction::Forward  => "Forward",
+                        Direction::Backward => "Backward",
+                    },
+                    "length_m":     (seg.length_m * 10.0).round() / 10.0,
+                    "start_node":   seg.start_node.0,
+                    "end_node":     seg.end_node.0,
+                    "tile":         tile,
+                    "local_index":  local_index,
+                    "vertex_count": seg.geometry.len(),
+                    "geometry":     seg.geometry.iter().map(|&(lon, lat)| [lon, lat]).collect::<Vec<_>>(),
+                }).to_string()
+            }
+        }
+    }
+
+    /// Find segments in the loaded graph whose geometry comes within `radius_m` of (lat, lon).
+    /// Results are sorted by distance and capped at 50.  Caps radius at 500 m.
+    pub fn get_segments_near(&self, lat: f64, lon: f64, radius_m: f64) -> String {
+        let cap = radius_m.min(500.0);
+        let mut hits: Vec<(f64, u32, u8, u8, &'static str, f64, Option<String>)> = self.loader.graph.segments.iter()
+            .filter_map(|(seg_id, seg)| {
+                let min_dist = seg.geometry.iter()
+                    .map(|&(slon, slat)| haversine_m(slon, slat, lon, lat))
+                    .fold(f64::INFINITY, f64::min);
+                if min_dist <= cap {
+                    let dir_str: &'static str = match seg.direction {
+                        Direction::Both     => "Both",
+                        Direction::Forward  => "Forward",
+                        Direction::Backward => "Backward",
+                    };
+                    Some((min_dist, seg_id.0, seg.frc, seg.fow, dir_str, seg.length_m, segment_source_key(&seg.stable_id)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        hits.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let segments: Vec<serde_json::Value> = hits.iter().take(50).map(|(dist, id, frc, fow, dir, len, src_key)| {
+            serde_json::json!({
+                "segment_id":  id,
+                "source_key":  src_key,
+                "frc":         frc,
+                "fow":         fow,
+                "direction":   dir,
+                "length_m":    (len * 10.0).round() / 10.0,
+                "distance_m":  (dist * 10.0).round() / 10.0,
+            })
+        }).collect();
+        serde_json::json!({
+            "query": { "lat": lat, "lon": lon, "radius_m": cap },
+            "count": segments.len(),
+            "segments": segments,
+        }).to_string()
+    }
+
+    /// Return all segments connected at each endpoint of `segment_id`.
+    ///
+    /// Reports two groups — `at_start_node` and `at_end_node` — each listing every other
+    /// segment that shares that node.  For each neighbour, `can_arrive` indicates whether a
+    /// traversal of that segment can *end* at the node; `can_depart` indicates whether it can
+    /// *begin* there.  Turn-restriction flags cover both transition directions through the node.
+    ///
+    /// This is direction-neutral and correct for bidirectional segments: a `Both` segment has
+    /// two valid traversal directions, so each endpoint is simultaneously an entry and an exit.
+    pub fn get_segment_neighbors(&self, segment_id: u32) -> String {
+        let seg_id = SegmentId(segment_id);
+        let seg = match self.loader.graph.segments.get(&seg_id) {
+            Some(s) => s,
+            None => return serde_json::json!({
+                "error": format!("Segment {segment_id} not found in loaded graph.")
+            }).to_string(),
+        };
+
+        let start_node = seg.start_node;
+        let end_node   = seg.end_node;
+
+        // Build neighbour entries for a given node id.
+        // `can_arrive`  = other's traversal can end at `node`
+        // `can_depart`  = other's traversal can begin at `node`
+        // Both are true for Direction::Both.
+        let mut build_entries = |node: NodeId| -> Vec<serde_json::Value> {
+            let mut entries = Vec::new();
+            for (&other_id, other) in &self.loader.graph.segments {
+                if other_id == seg_id { continue; }
+                let touches_node = other.start_node == node || other.end_node == node;
+                if !touches_node { continue; }
+
+                let dir_str: &'static str = match other.direction {
+                    Direction::Both     => "Both",
+                    Direction::Forward  => "Forward",
+                    Direction::Backward => "Backward",
+                };
+                // Forward/Both traversal: start_node→end_node.  Departs from start_node, arrives at end_node.
+                // Backward/Both traversal: end_node→start_node. Departs from end_node, arrives at start_node.
+                let can_arrive = (matches!(other.direction, Direction::Forward  | Direction::Both) && other.end_node   == node)
+                              || (matches!(other.direction, Direction::Backward | Direction::Both) && other.start_node == node);
+                let can_depart = (matches!(other.direction, Direction::Forward  | Direction::Both) && other.start_node == node)
+                              || (matches!(other.direction, Direction::Backward | Direction::Both) && other.end_node   == node);
+
+                // Turn restrictions in both directions through this node.
+                let restricted_into_self  = can_arrive  && self.loader.graph.is_restricted(other_id, node, seg_id);
+                let restricted_from_self  = can_depart  && self.loader.graph.is_restricted(seg_id,   node, other_id);
+
+                entries.push(serde_json::json!({
+                    "segment_id":            other_id.0,
+                    "source_key":            segment_source_key(&other.stable_id),
+                    "frc":                   other.frc,
+                    "fow":                   other.fow,
+                    "direction":             dir_str,
+                    "length_m":              (other.length_m * 10.0).round() / 10.0,
+                    "can_arrive":            can_arrive,
+                    "can_depart":            can_depart,
+                    "restricted_into_self":  restricted_into_self,
+                    "restricted_from_self":  restricted_from_self,
+                }));
+            }
+            entries
+        };
+
+        let at_start = build_entries(start_node);
+        let at_end   = build_entries(end_node);
+
+        serde_json::json!({
+            "segment_id":  segment_id,
+            "direction":   match seg.direction {
+                Direction::Both     => "Both",
+                Direction::Forward  => "Forward",
+                Direction::Backward => "Backward",
+            },
+            "start_node": {
+                "node_id":  start_node.0,
+                "count":    at_start.len(),
+                "segments": at_start,
+            },
+            "end_node": {
+                "node_id":  end_node.0,
+                "count":    at_end.len(),
+                "segments": at_end,
+            },
+        }).to_string()
+    }
+
+    /// Re-run the decode with `params_override` merged over the current params.
+    /// Tiles must already be loaded; returns an error if a new tile is required.
+    /// Returns a compact comparison result — call get_decode_summary for full segment details.
+    pub fn retry_decode(&mut self, params_override: &str) -> String {
+        let loc_ref = match &self.location_ref {
+            Some(r) => r,
+            None => return serde_json::json!({"ok": false, "error": "no reference loaded; call start() first"}).to_string(),
+        };
+        let merged = match merge_params(&self.params, params_override) {
+            Ok(p) => p,
+            Err(e) => return serde_json::json!({"ok": false, "error": format!("invalid params override: {e}")}).to_string(),
+        };
+        // Temporarily apply merged params, decode, restore originals.
+        let saved = std::mem::replace(&mut self.params, merged.clone());
+        let raw = self.decode();
+        self.params = saved;
+
+        // Parse just the fields we need for a compact comparison response.
+        let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => return raw,
+        };
+        if parsed.get("needs_tile").is_some() {
+            return serde_json::json!({
+                "ok": false,
+                "error": "retry requires a tile that is not loaded; re-run the full decode from the UI to load additional tiles",
+                "params_applied": merged,
+            }).to_string();
+        }
+        let ok = parsed["ok"].as_bool().unwrap_or(false);
+        let seg_count = parsed["segments"].as_array().map(|a| a.len()).unwrap_or(0);
+        let path_total: f64 = parsed["segments"].as_array()
+            .map(|segs| segs.iter().filter_map(|s| s["length_m"].as_f64()).sum())
+            .unwrap_or(0.0);
+        serde_json::json!({
+            "ok": ok,
+            "error": parsed["error"],
+            "segment_count": seg_count,
+            "path_total_length_m": (path_total * 10.0).round() / 10.0,
+            "lrp_count": parsed["lrps"].as_array().map(|a| a.len()),
+            "params_applied": merged,
+        }).to_string()
+    }
+}
+
+// ── Segment source-key helper ─────────────────────────────────────────────────
+
+/// Decode the human-readable source key from a segment's `stable_id`.
+///
+/// Layout (matching tileDecoder.js and the tile build pipeline):
+///   bytes  0–7:  source integer (i64 LE) — OSM way id or similar
+///   bytes  8–11: split index (u32 LE)    — 0 for unsplit segments
+///   bytes 12–15: 0x00 for integer ids; non-zero for full GERS UUIDs
+///
+/// Returns `"{source_int}-{split_idx}"` for integer ids, `None` for GERS UUIDs and
+/// all-zero synthetic ids.
+fn segment_source_key(stable_id: &[u8; 16]) -> Option<String> {
+    if stable_id[12..16] != [0u8; 4] { return None; }
+    let source_int = i64::from_le_bytes(stable_id[0..8].try_into().unwrap());
+    if source_int == 0 { return None; }
+    let split_idx = u32::from_le_bytes(stable_id[8..12].try_into().unwrap());
+    Some(format!("{source_int}-{split_idx}"))
+}
+
+// ── Param merge helper ────────────────────────────────────────────────────────
+
+fn merge_params(base: &DecodeParams, override_json: &str) -> Result<DecodeParams, serde_json::Error> {
+    let mut base_val = serde_json::to_value(base)?;
+    let overlay: serde_json::Value = serde_json::from_str(override_json)?;
+    if let (Some(base_obj), Some(overlay_obj)) = (base_val.as_object_mut(), overlay.as_object()) {
+        for (k, v) in overlay_obj {
+            base_obj.insert(k.clone(), v.clone());
+        }
+    }
+    serde_json::from_value(base_val)
 }
 
 // ── Format auto-detection ─────────────────────────────────────────────────────

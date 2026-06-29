@@ -533,6 +533,7 @@ export default function MapView({ tilesBase, ready }) {
   const requestedInfoSegment       = useStore(s => s.requestedInfoSegment);
   const clearRequestedInfoSegment  = useStore(s => s.clearRequestedInfoSegment);
   const traceHighlightSegIds  = useStore(s => s.traceHighlightSegIds);
+  const traceHighlightSnaps   = useStore(s => s.traceHighlightSnaps);
   const traceLrpFocus         = useStore(s => s.traceLrpFocus);
   const setTraceLrpFocus      = useStore(s => s.setTraceLrpFocus);
   const showSegmentLayer      = useStore(s => s.showSegmentLayer);
@@ -1282,9 +1283,11 @@ export default function MapView({ tilesBase, ready }) {
     if (!e.features?.length) return;
 
     // When multiple features overlap near a segment boundary, pick the one whose
-    // polyline geometry is closest to the click point rather than the arbitrary
-    // first feature MapLibre returns.
-    const { lng, lat } = e.lngLat;
+    // polyline geometry is closest to the click point in PIXEL space.  Geographic
+    // distance fails at shared endpoints: both segments are equidistant there, so
+    // whichever MapLibre returns first wins.  Pixel space matches what the user sees.
+    const map = mapRef.current;
+    const cp = e.point;                  // {x, y} pixels
     let bestFeat = e.features[0];
     let bestDist = Infinity;
     for (const feat of e.features) {
@@ -1292,12 +1295,12 @@ export default function MapView({ tilesBase, ready }) {
       if (!coords?.length) continue;
       let minD = Infinity;
       for (let i = 0; i < coords.length - 1; i++) {
-        const ax = coords[i][0],   ay = coords[i][1];
-        const bx = coords[i+1][0], by = coords[i+1][1];
-        const dx = bx - ax, dy = by - ay;
+        const ap = map.project(coords[i]);
+        const bp = map.project(coords[i + 1]);
+        const dx = bp.x - ap.x, dy = bp.y - ap.y;
         const len2 = dx * dx + dy * dy;
-        const t = len2 === 0 ? 0 : Math.max(0, Math.min(1, ((lng - ax) * dx + (lat - ay) * dy) / len2));
-        const ex = lng - (ax + t * dx), ey = lat - (ay + t * dy);
+        const t = len2 === 0 ? 0 : Math.max(0, Math.min(1, ((cp.x - ap.x) * dx + (cp.y - ap.y) * dy) / len2));
+        const ex = cp.x - (ap.x + t * dx), ey = cp.y - (ap.y + t * dy);
         const d = ex * ex + ey * ey;
         if (d < minD) minD = d;
       }
@@ -1339,7 +1342,8 @@ export default function MapView({ tilesBase, ready }) {
     const segments = decodeResultRef.current?.segments;
     if (!segments?.length) return;
 
-    const { lng, lat } = e.lngLat;
+    const map = mapRef.current;
+    const cp = e.point;
     const cache = getSegGeomCache();
     let best = null, bestDist = Infinity;
 
@@ -1349,11 +1353,18 @@ export default function MapView({ tilesBase, ready }) {
       const feat = segId >= 0 ? cache.get(segId) : null;
       if (!feat) continue;
       const coords = feat.geometry.coordinates;
-      // Use midpoint of the segment for distance comparison.
-      const mid = polylineMid(coords);
-      const dx = mid[0] - lng, dy = mid[1] - lat;
-      const d = dx * dx + dy * dy;
-      if (d < bestDist) { bestDist = d; best = { feat, segId }; }
+      let minD = Infinity;
+      for (let i = 0; i < coords.length - 1; i++) {
+        const ap = map.project(coords[i]);
+        const bp = map.project(coords[i + 1]);
+        const dx = bp.x - ap.x, dy = bp.y - ap.y;
+        const len2 = dx * dx + dy * dy;
+        const t = len2 === 0 ? 0 : Math.max(0, Math.min(1, ((cp.x - ap.x) * dx + (cp.y - ap.y) * dy) / len2));
+        const ex = cp.x - (ap.x + t * dx), ey = cp.y - (ap.y + t * dy);
+        const d = ex * ex + ey * ey;
+        if (d < minD) minD = d;
+      }
+      if (minD < bestDist) { bestDist = minD; best = { feat, segId }; }
     }
 
     if (best) {
@@ -1558,6 +1569,20 @@ export default function MapView({ tilesBase, ready }) {
       if (feat.geometry?.coordinates) allCoords.push(...feat.geometry.coordinates);
     }
 
+    // Clip first/last segment at LRP snap points when highlighting a leg route.
+    if (traceHighlightSnaps && features.length > 0) {
+      const { from, to } = traceHighlightSnaps;
+      if (from && features[0]?.geometry?.coordinates) {
+        const coords = clipGeomFromPoint(features[0].geometry.coordinates, from[0], from[1]);
+        if (coords) features[0] = { ...features[0], geometry: { type: 'LineString', coordinates: coords } };
+      }
+      const last = features.length - 1;
+      if (to && features[last]?.geometry?.coordinates) {
+        const coords = clipGeomToPoint(features[last].geometry.coordinates, to[0], to[1]);
+        if (coords) features[last] = { ...features[last], geometry: { type: 'LineString', coordinates: coords } };
+      }
+    }
+
     // When a candidate popup is active for a Backward traversal, reverse the
     // coordinate order so trace-segment-arrow chevrons point the correct way.
     const cp = candidatePopupRef.current;
@@ -1629,7 +1654,7 @@ export default function MapView({ tilesBase, ready }) {
       map.once('moveend', moveEndHandler);
       return () => map.off('moveend', moveEndHandler);
     }
-  }, [traceHighlightSegIds]);
+  }, [traceHighlightSegIds, traceHighlightSnaps]);
 
   // ── Trace panel LRP focus (pan + popup) ─────────────────────────────────────
 

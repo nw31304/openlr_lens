@@ -4,6 +4,7 @@ import { decodeTile } from './tileDecoder.js';
 import { buildReplaySteps } from './replayEngine.js';
 import { loadLlmConfig, saveLlmConfig, clearLlmConfig as clearLlmStorage, chatComplete } from './llmClient.js';
 import { buildSystemContext } from './llmDiagnosis.js';
+import { TOOL_DEFINITIONS, executeTool } from './llm/tools.js';
 
 let _pmtiles = null;
 let _decoder = null;
@@ -116,6 +117,24 @@ export const PRESETS = {
   },
 };
 
+// Produce a human-readable label for a tool call, incorporating key arguments.
+function toolCallLabel(name, args) {
+  switch (name) {
+    case 'get_lrp_candidates': return `get_lrp_candidates(${args.lrp_index ?? '?'})`;
+    case 'get_leg_summary':    return `get_leg_summary(${args.leg_index ?? '?'})`;
+    case 'get_route_segments': return `get_route_segments(${args.leg_index ?? '?'})`;
+    default: return name;
+  }
+}
+
+// Summarise an array of tool call records into the shape stored in llmLastToolActivity.
+function buildToolActivity(calls) {
+  return {
+    calls,
+    total_result_bytes: calls.reduce((s, c) => s + c.result_bytes, 0),
+  };
+}
+
 export const useStore = create(persist(
  (set, get) => ({
   openlrString: '',
@@ -128,7 +147,9 @@ export const useStore = create(persist(
   showReplay: false,
   llmConfig: loadLlmConfig(),
   llmChatOpen: false,
-  llmMessages: [],   // { role: 'user'|'assistant', content: string, error?: bool }
+  llmMessages: [],     // display: { role, content, display?, error? }
+  llmApiHistory: [],   // api: full history including tool call/result turns (not shown in UI)
+  llmLastToolActivity: null, // { calls: [{label, result_bytes}], total_bytes } for last exchange
   llmLoading: false,
   showSegmentLayer: false,
   decoding: false,
@@ -136,6 +157,7 @@ export const useStore = create(persist(
   savedParamSets: {},      // { [name: string]: DecodeParams }
   highlightedSegment: null,
   traceHighlightSegIds: null,
+  traceHighlightSnaps: null,   // { from: [lon,lat], to: [lon,lat] } when highlighting a leg route
   traceLrpFocus: null,
   candidatePopup: null,
   // ── Replay state ─────────────────────────────────────────────────────────
@@ -183,26 +205,93 @@ export const useStore = create(persist(
   clearLlmConfig: () => { clearLlmStorage(); set({ llmConfig: null }); },
 
   toggleLlmChat: () => set(s => ({ llmChatOpen: !s.llmChatOpen })),
-  clearLlmChat:  () => set({ llmMessages: [], llmLoading: false }),
+  clearLlmChat:  () => set({ llmMessages: [], llmApiHistory: [], llmLastToolActivity: null, llmLoading: false }),
 
   // content = text sent to the API (may include appended format hints)
   // display = text shown in the chat bubble (the user's original words)
   sendLlmMessage: async (content, display) => {
-    const { llmMessages, decodeResult, params, llmConfig } = get();
+    const { llmMessages, llmApiHistory, decodeResult, params, llmConfig } = get();
     if (!llmConfig || !decodeResult) return;
-    const userMsg = { role: 'user', content, display: display ?? content };
-    set({ llmMessages: [...llmMessages, userMsg], llmLoading: true });
+
+    const userDisplayMsg = { role: 'user', content, display: display ?? content };
+    set({ llmMessages: [...llmMessages, userDisplayMsg], llmLastToolActivity: null, llmLoading: true });
+
+    // Rebuild system context each turn so parameter changes are reflected immediately
     const systemContext = buildSystemContext(decodeResult, params);
-    const history = [
+
+    // apiHistory is the full multi-turn API conversation (includes tool call/result turns)
+    let apiHistory = [
       { role: 'system', content: systemContext },
-      ...llmMessages.map(m => ({ role: m.role, content: m.content })),
+      ...llmApiHistory,
       { role: 'user', content },
     ];
-    const result = await chatComplete(llmConfig, history);
-    const assistantMsg = result.ok
-      ? { role: 'assistant', content: result.content ?? '' }
-      : { role: 'assistant', content: result.error ?? 'Unknown error', error: true };
-    set(s => ({ llmMessages: [...s.llmMessages, assistantMsg], llmLoading: false }));
+
+    // Track new entries added this turn so we can persist them after the loop
+    const newApiEntries = [{ role: 'user', content }];
+    // Accumulate tool call activity for the strip display
+    const toolCalls = [];
+
+    const MAX_STEPS = 8;
+    for (let step = 0; step < MAX_STEPS; step++) {
+      const resp = await chatComplete(llmConfig, apiHistory, TOOL_DEFINITIONS);
+
+      if (!resp.ok) {
+        set(s => ({
+          llmMessages: [...s.llmMessages, { role: 'assistant', content: resp.error ?? 'Unknown error', error: true }],
+          llmLastToolActivity: toolCalls.length ? buildToolActivity(toolCalls) : null,
+          llmLoading: false,
+        }));
+        return;
+      }
+
+      if (!resp.tool_calls?.length) {
+        // Final text response — save display message + full api history
+        const assistantMsg = { role: 'assistant', content: resp.content ?? '' };
+        const finalApiEntry = { role: 'assistant', content: resp.content ?? '' };
+        set(s => ({
+          llmMessages: [...s.llmMessages, assistantMsg],
+          llmApiHistory: [...llmApiHistory, ...newApiEntries, finalApiEntry],
+          llmLastToolActivity: toolCalls.length ? buildToolActivity(toolCalls) : null,
+          llmLoading: false,
+        }));
+        return;
+      }
+
+      // Tool-use round: add assistant tool-call message to history and execute each tool
+      const assistantApiEntry = {
+        role: 'assistant',
+        content: resp.content ?? null,
+        tool_calls: resp.tool_calls,
+      };
+      newApiEntries.push(assistantApiEntry);
+      apiHistory = [...apiHistory, assistantApiEntry];
+
+      for (const tc of resp.tool_calls) {
+        let toolResult;
+        try {
+          const args = JSON.parse(tc.function.arguments);
+          toolResult = executeTool(tc.function.name, args, { decodeResult, params, decoder: _decoder });
+          toolCalls.push({
+            label: toolCallLabel(tc.function.name, args),
+            args_bytes: tc.function.arguments.length,
+            result_bytes: toolResult.length,
+          });
+        } catch (e) {
+          toolResult = JSON.stringify({ error: e.message });
+          toolCalls.push({ label: tc.function.name, args_bytes: 0, result_bytes: toolResult.length });
+        }
+        const toolApiEntry = { role: 'tool', tool_call_id: tc.id, content: toolResult };
+        newApiEntries.push(toolApiEntry);
+        apiHistory = [...apiHistory, toolApiEntry];
+      }
+    }
+
+    // Reached max steps without a final answer
+    set(s => ({
+      llmMessages: [...s.llmMessages, { role: 'assistant', content: '[Max tool call steps reached without a final response]', error: true }],
+      llmLastToolActivity: toolCalls.length ? buildToolActivity(toolCalls) : null,
+      llmLoading: false,
+    }));
   },
   toggleTrace:         () => set(state => ({ showTrace:         !state.showTrace })),
   toggleReplay:        () => set(state => ({ showReplay:        !state.showReplay })),
@@ -225,14 +314,14 @@ export const useStore = create(persist(
 
   hideResult:    () => set({ showResult: false }),
   toggleResult:  () => set(state => ({ showResult: !state.showResult })),
-  clearResult: () => set({ decodeResult: null, showResult: false, highlightedSegment: null, traceHighlightSegIds: null, traceLrpFocus: null, candidatePopup: null }),
+  clearResult: () => set({ decodeResult: null, showResult: false, highlightedSegment: null, traceHighlightSegIds: null, traceHighlightSnaps: null, traceLrpFocus: null, candidatePopup: null, llmApiHistory: [] }),
   setHighlightedSegment: (seg) => set({ highlightedSegment: seg }),
   // Request the segment info popup to open for a given tile+local_index.
   // Map.jsx watches this and opens the popup; call clearRequestedInfoSegment() after handling.
   requestedInfoSegment: null,
   requestInfoSegment:      (tile, local_index) => set({ requestedInfoSegment: { tile, local_index } }),
   clearRequestedInfoSegment: () => set({ requestedInfoSegment: null }),
-  setTraceHighlight: (ids) => set({ traceHighlightSegIds: ids?.length ? ids : null }),
+  setTraceHighlight: (ids, snaps) => set({ traceHighlightSegIds: ids?.length ? ids : null, traceHighlightSnaps: snaps ?? null }),
   setCandidatePopup: (data) => set({ candidatePopup: data }),
   clearCandidatePopup: () => set({ candidatePopup: null }),
   setTraceLrpFocus: (lrp) => set({ traceLrpFocus: lrp ? { ...lrp, _tick: Date.now() } : null }),
@@ -241,7 +330,7 @@ export const useStore = create(persist(
     const { openlrString, params } = get();
     if (!openlrString.trim() || !_pmtiles || !_decoder) return;
 
-    set({ decoding: true, decodeResult: null, highlightedSegment: null, traceHighlightSegIds: null, candidatePopup: null, llmMessages: [], llmLoading: false });
+    set({ decoding: true, decodeResult: null, highlightedSegment: null, traceHighlightSegIds: null, candidatePopup: null, llmMessages: [], llmApiHistory: [], llmLoading: false });
     _tileGeomCache = new Map();
     _segIdToTile   = new Map();
     _segGeomCache  = new Map();

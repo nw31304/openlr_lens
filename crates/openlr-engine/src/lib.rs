@@ -81,6 +81,11 @@ pub enum DecodeError {
     /// Not a permanent failure — the caller must load the tile and retry decode.
     #[error("tile {}/{}/{} required by A*", .0.z, .0.x, .0.y)]
     NeedsTile(TileKey),
+    /// Combined positive + negative offsets exceed the decoded path length.
+    /// The trimmed location would have zero or negative length — the reference is malformed.
+    /// The routed path is carried here so the caller can still expose segment data for diagnostics.
+    #[error("offsets overflow path: combined lower-bound {combined_lb_m:.1} m ≥ path {path_m:.1} m")]
+    OffsetOverflow { combined_lb_m: f64, path_m: f64, path: Vec<SegmentId> },
 }
 
 /// Bundles a `DecodeError` with the partial `DecodeTrace` accumulated before the failure.
@@ -253,8 +258,6 @@ pub fn decode(
     };
 
     // ── 3. Offsets ──────────────────────────────────────────────────────────
-    let t = trace.get_or_insert_with(|| Trace::new(params.clone()));
-
     // For v3: raw byte N → [N/256 × L, (N+1)/256 × L] using the actual total path
     // length L.  Both bounds use the same L so the bucket width is exactly L/256.
     // For TPEG: pos_offset/neg_offset are already exact LinearInterval::point values
@@ -272,12 +275,30 @@ pub fn decode(
         }).or(l.neg_offset)
     });
 
-    // Emit trace events for the offset intervals (no midpoint computed).
-    if let Some(interval) = pos_offset {
-        t.push_summary(trace::DecodeEvent::OffsetApplied { is_positive: true, interval });
+    // Emit trace events (scoped so the borrow on `trace` ends before the overflow check).
+    {
+        let t = trace.get_or_insert_with(|| Trace::new(params.clone()));
+        if let Some(interval) = pos_offset {
+            t.push_summary(trace::DecodeEvent::OffsetApplied { is_positive: true, interval });
+        }
+        if let Some(interval) = neg_offset {
+            t.push_summary(trace::DecodeEvent::OffsetApplied { is_positive: false, interval });
+        }
     }
-    if let Some(interval) = neg_offset {
-        t.push_summary(trace::DecodeEvent::OffsetApplied { is_positive: false, interval });
+
+    // Validate: combined lower-bound offsets must not reach or exceed the path length.
+    // If they do, the trimmed location has zero or negative length — the reference is malformed.
+    let combined_offset_lb =
+        pos_offset.map_or(0.0, |i| i.lb) + neg_offset.map_or(0.0, |i| i.lb);
+    if (pos_offset.is_some() || neg_offset.is_some()) && combined_offset_lb >= total_path_m {
+        return Err(DecodeFailure {
+            error: DecodeError::OffsetOverflow {
+                combined_lb_m: combined_offset_lb,
+                path_m: total_path_m,
+                path: path.clone(),
+            },
+            trace,
+        });
     }
 
     // ── 4. LRP arc offsets, snap points, traversal directions ──────────────

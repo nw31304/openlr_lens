@@ -114,10 +114,56 @@ async function openaiComplete({ baseUrl, apiKey, model }, messages, tools, authS
   }
 }
 
+// Convert an OpenAI-format message array to Anthropic message format.
+// Handles tool call / tool result messages in conversation history:
+//   - role:'tool' → role:'user' with tool_result content blocks (grouped so
+//     consecutive tool results become a single user turn, as Anthropic requires)
+//   - assistant messages with tool_calls → tool_use content blocks
+function toAnthropicMessages(messages) {
+  const out = [];
+  let i = 0;
+  while (i < messages.length) {
+    const m = messages[i];
+    // Group consecutive tool-result messages into one user turn
+    if (m.role === 'tool') {
+      const blocks = [];
+      while (i < messages.length && messages[i].role === 'tool') {
+        blocks.push({
+          type: 'tool_result',
+          tool_use_id: messages[i].tool_call_id,
+          content: messages[i].content,
+        });
+        i++;
+      }
+      out.push({ role: 'user', content: blocks });
+      continue;
+    }
+    // Assistant message that called tools → tool_use content blocks
+    if (m.tool_calls?.length) {
+      const content = [];
+      if (m.content) content.push({ type: 'text', text: m.content });
+      for (const tc of m.tool_calls) {
+        content.push({
+          type: 'tool_use',
+          id: tc.id,
+          name: tc.function.name,
+          input: JSON.parse(tc.function.arguments),
+        });
+      }
+      out.push({ role: 'assistant', content });
+      i++;
+      continue;
+    }
+    out.push(m);
+    i++;
+  }
+  return out;
+}
+
 async function anthropicComplete({ baseUrl, apiKey, model }, messages, tools) {
   // Anthropic native schema: system prompt is a top-level field; tools have input_schema.
   const systemMsg = messages.find(m => m.role === 'system');
-  const nonSystem = messages.filter(m => m.role !== 'system');
+  const nonSystem = toAnthropicMessages(messages.filter(m => m.role !== 'system'));
 
   const headers = {
     'Content-Type': 'application/json',
