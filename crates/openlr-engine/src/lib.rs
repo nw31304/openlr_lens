@@ -157,7 +157,7 @@ pub fn decode(
     // not loaded.  It lives outside the block so we can inspect it after `t` drops.
     let mut needs_tile: Option<TileKey> = None;
     let mut deepest_failed_leg: usize = 0;
-    let route_result: Option<(Vec<SegmentId>, f64, Vec<usize>)> = {
+    let route_result: Option<(Vec<SegmentId>, f64, Vec<f64>, Vec<usize>)> = {
         let t = trace.get_or_insert_with(|| Trace::new(params.clone()));
         let mut route_cache: RouteCache = HashMap::new();
 
@@ -182,7 +182,7 @@ pub fn decode(
         // Guard: both projections must be within 25 % of the search radius.  DNP
         // validation is the ultimate safety net for false positives.
         let nearby_threshold = params.candidate_search_radius_m * 0.25;
-        let precheck: Option<(Vec<SegmentId>, f64, Vec<usize>)> = 'precheck: {
+        let precheck: Option<(Vec<SegmentId>, f64, Vec<f64>, Vec<usize>)> = 'precheck: {
             if lrps.len() == 2 {
                 for (i, from_cand) in all_candidates[0].iter().enumerate() {
                     for (j, to_cand) in all_candidates[1].iter().enumerate() {
@@ -201,11 +201,11 @@ pub fn decode(
                         if is_same_seg || is_adjacent {
                             let indices = vec![i, j];
                             let mut fl = 0usize;
-                            if let Some((p, len)) = try_route_combination(
+                            if let Some((p, len, legs)) = try_route_combination(
                                 &indices, &all_candidates, lrps, graph, params, t,
                                 &mut route_cache, &mut needs_tile, zoom, &mut fl,
                             ) {
-                                break 'precheck Some((p, len, indices));
+                                break 'precheck Some((p, len, legs, indices));
                             }
                             if needs_tile.is_some() { break 'precheck None; }
                         }
@@ -233,11 +233,11 @@ pub fn decode(
                     }
                     route_attempts += 1;
                     let mut failed_leg = 0usize;
-                    if let Some((p, len)) = try_route_combination(
+                    if let Some((p, len, legs)) = try_route_combination(
                         &indices, &all_candidates, lrps, graph, params, t,
                         &mut route_cache, &mut needs_tile, zoom, &mut failed_leg,
                     ) {
-                        break 'search Some((p, len, indices));
+                        break 'search Some((p, len, legs, indices));
                     }
                     if needs_tile.is_some() { break 'search None; }
                     deepest_failed_leg = deepest_failed_leg.max(failed_leg);
@@ -257,26 +257,28 @@ pub fn decode(
         return Err(DecodeFailure { error: DecodeError::NeedsTile(tk), trace: None });
     }
 
-    let (path, total_path_m, winning_indices): (Vec<SegmentId>, f64, Vec<usize>) = match route_result {
+    let (path, total_path_m, leg_lengths, winning_indices): (Vec<SegmentId>, f64, Vec<f64>, Vec<usize>) = match route_result {
         Some(r) => r,
         None => return Err(DecodeFailure { error: DecodeError::AllCombinationsFailed(deepest_failed_leg + 1), trace }),
     };
 
     // ── 3. Offsets ──────────────────────────────────────────────────────────
-    // For v3: raw byte N → [N/256 × L, (N+1)/256 × L] using the actual total path
-    // length L.  Both bounds use the same L so the bucket width is exactly L/256.
-    // For TPEG: pos_offset/neg_offset are already exact LinearInterval::point values
-    // set by the decoder; raw bytes are None.
+    // Per spec §7.5.2: the offset byte encodes a fraction of the path between
+    // the FIRST two LRPs (positive offset) or the LAST two LRPs (negative offset),
+    // not the total path.  Use the actual decoded leg lengths from routing.
+    // For TPEG: pos_offset/neg_offset are already exact LinearInterval::point values.
+    let first_leg_m = leg_lengths.first().copied().unwrap_or(total_path_m);
+    let last_leg_m  = leg_lengths.last().copied().unwrap_or(total_path_m);
     let pos_offset: Option<LinearInterval> = lrps.first().and_then(|l| {
         l.pos_offset_raw.map(|n| LinearInterval {
-            lb: n as f64 / 256.0 * total_path_m,
-            ub: (n as f64 + 1.0) / 256.0 * total_path_m,
+            lb: n as f64 / 256.0 * first_leg_m,
+            ub: (n as f64 + 1.0) / 256.0 * first_leg_m,
         }).or(l.pos_offset)
     });
     let neg_offset: Option<LinearInterval> = lrps.last().and_then(|l| {
         l.neg_offset_raw.map(|n| LinearInterval {
-            lb: n as f64 / 256.0 * total_path_m,
-            ub: (n as f64 + 1.0) / 256.0 * total_path_m,
+            lb: n as f64 / 256.0 * last_leg_m,
+            ub: (n as f64 + 1.0) / 256.0 * last_leg_m,
         }).or(l.neg_offset)
     });
 
@@ -382,9 +384,10 @@ fn try_route_combination(
     needs_tile: &mut Option<TileKey>,
     zoom: u8,
     out_failed_leg: &mut usize,
-) -> Option<(Vec<SegmentId>, f64)> {
+) -> Option<(Vec<SegmentId>, f64, Vec<f64>)> {
     let mut path: Vec<SegmentId> = Vec::new();
     let mut total_path_m: f64 = 0.0;
+    let mut leg_lengths: Vec<f64> = Vec::with_capacity(lrps.len().saturating_sub(1));
 
     for leg in 0..lrps.len() - 1 {
         let from = &all_candidates[leg][indices[leg]];
@@ -416,6 +419,7 @@ fn try_route_combination(
                 from_snap: from.projection.point,
                 to_snap:   to.projection.point,
             });
+            leg_lengths.push(direct_m);
             total_path_m += direct_m;
             if path.is_empty() {
                 path.push(from.segment_id);
@@ -500,6 +504,7 @@ fn try_route_combination(
                 to_snap:   to.projection.point,
             });
         }
+        leg_lengths.push(full_length_m);
         total_path_m += full_length_m;
 
         if path.is_empty() {
@@ -522,7 +527,7 @@ fn try_route_combination(
         return None;
     }
 
-    Some((path, total_path_m))
+    Some((path, total_path_m, leg_lengths))
 }
 
 // ── Forced decode (skip candidate selection) ──────────────────────────────────
@@ -555,7 +560,7 @@ pub fn decode_forced(
 
     let mut deepest_failed_leg: usize = 0;
     let mut needs_tile: Option<TileKey> = None;
-    let route_result: Option<(Vec<SegmentId>, f64)> = {
+    let route_result: Option<(Vec<SegmentId>, f64, Vec<f64>)> = {
         let t = trace.get_or_insert_with(|| Trace::new(params.clone()));
         let mut route_cache: RouteCache = HashMap::new();
         let result = try_route_combination(
@@ -574,7 +579,7 @@ pub fn decode_forced(
         return Err(DecodeFailure { error: DecodeError::NeedsTile(tk), trace: None });
     }
 
-    let (path, total_path_m) = match route_result {
+    let (path, total_path_m, leg_lengths) = match route_result {
         Some(r) => r,
         None => return Err(DecodeFailure {
             error: DecodeError::AllCombinationsFailed(deepest_failed_leg + 1),
@@ -583,16 +588,20 @@ pub fn decode_forced(
     };
 
     // ── Offsets ───────────────────────────────────────────────────────────────
+    // Per spec §7.5.2: offset fraction is relative to the first leg (pos) or
+    // last leg (neg), not the total path length.
+    let first_leg_m = leg_lengths.first().copied().unwrap_or(total_path_m);
+    let last_leg_m  = leg_lengths.last().copied().unwrap_or(total_path_m);
     let pos_offset: Option<LinearInterval> = lrps.first().and_then(|l| {
         l.pos_offset_raw.map(|n| LinearInterval {
-            lb: n as f64 / 256.0 * total_path_m,
-            ub: (n as f64 + 1.0) / 256.0 * total_path_m,
+            lb: n as f64 / 256.0 * first_leg_m,
+            ub: (n as f64 + 1.0) / 256.0 * first_leg_m,
         }).or(l.pos_offset)
     });
     let neg_offset: Option<LinearInterval> = lrps.last().and_then(|l| {
         l.neg_offset_raw.map(|n| LinearInterval {
-            lb: n as f64 / 256.0 * total_path_m,
-            ub: (n as f64 + 1.0) / 256.0 * total_path_m,
+            lb: n as f64 / 256.0 * last_leg_m,
+            ub: (n as f64 + 1.0) / 256.0 * last_leg_m,
         }).or(l.neg_offset)
     });
     {

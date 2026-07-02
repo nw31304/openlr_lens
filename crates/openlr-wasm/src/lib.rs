@@ -394,19 +394,21 @@ impl Decoder {
                         })
                     })
                     .collect();
-                let dnp_lb_sum: f64 = loc_ref.lrps.iter()
-                    .filter_map(|l| l.dnp.map(|d| d.lb)).sum();
-                let dnp_ub_sum: f64 = loc_ref.lrps.iter()
-                    .filter_map(|l| l.dnp.map(|d| d.ub)).sum();
+                // Per spec §7.5.2: offset byte is relative to the first-leg DNP
+                // (positive) or last-leg DNP (negative), not the total path length.
+                // The second-to-last LRP holds the last leg's DNP.
+                let n_lrps = loc_ref.lrps.len();
+                let first_leg_dnp = loc_ref.lrps.first().and_then(|l| l.dnp);
+                let last_leg_dnp  = loc_ref.lrps.get(n_lrps.saturating_sub(2)).and_then(|l| l.dnp);
                 let (pos_offset_lb, pos_offset_ub, pos_approx) = approximate_offset(
                     loc_ref.lrps.first().and_then(|l| l.pos_offset_raw),
                     loc_ref.lrps.first().and_then(|l| l.pos_offset),
-                    dnp_lb_sum, dnp_ub_sum,
+                    first_leg_dnp,
                 );
                 let (neg_offset_lb, neg_offset_ub, neg_approx) = approximate_offset(
                     loc_ref.lrps.last().and_then(|l| l.neg_offset_raw),
                     loc_ref.lrps.last().and_then(|l| l.neg_offset),
-                    dnp_lb_sum, dnp_ub_sum,
+                    last_leg_dnp,
                 );
                 let full_result = DecodeResult {
                     lrps: lrp_info_vec(&loc_ref.lrps, &[], &[], &[]),
@@ -796,14 +798,16 @@ impl Decoder {
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-/// Compute approximate offset bounds for a failed decode using DNP sum as the
-/// path-length proxy. Returns (lb, ub, approximate). When no offset is encoded
-/// returns (0.0, 0.0, false). TPEG offsets are exact even on failure.
+/// Compute approximate offset bounds for a failed decode using the relevant leg's
+/// DNP as the LRP_length proxy (spec §7.5.2). Returns (lb, ub, approximate).
+/// When no offset is encoded returns (0.0, 0.0, false).
+/// TPEG offsets are exact even on failure (`exact` is Some, `raw` is None).
 fn approximate_offset(raw: Option<u8>, exact: Option<openlr_codec::LinearInterval>,
-                      dnp_lb_sum: f64, dnp_ub_sum: f64) -> (f64, f64, bool) {
+                      leg_dnp: Option<openlr_codec::LinearInterval>) -> (f64, f64, bool) {
     if let Some(n) = raw {
-        let lb = n as f64 / 256.0 * dnp_lb_sum;
-        let ub = (n as f64 + 1.0) / 256.0 * dnp_ub_sum;
+        let (dnp_lb, dnp_ub) = leg_dnp.map(|d| (d.lb, d.ub)).unwrap_or((0.0, 0.0));
+        let lb = n as f64 / 256.0 * dnp_lb;
+        let ub = (n as f64 + 1.0) / 256.0 * dnp_ub;
         (lb, ub, true)
     } else if let Some(i) = exact {
         (i.lb, i.ub, false)
