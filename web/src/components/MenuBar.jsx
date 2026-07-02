@@ -86,7 +86,12 @@ export default function MenuBar() {
           className={`menu-btn${showResult ? ' active' : ''}`}
           onClick={toggleResult}
           title="Toggle results panel"
-        >Results</button>
+        >
+          Results
+          {decodeResult.ok
+            ? <span className="menu-result-badge menu-result-ok">{decodeResult.segments?.length ?? '✓'}</span>
+            : <span className="menu-result-badge menu-result-fail">✗</span>}
+        </button>
       )}
 
       <div className="menu-spacer" />

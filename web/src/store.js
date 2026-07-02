@@ -155,6 +155,7 @@ export const useStore = create(persist(
   showSegmentLayer: false,
   decoding: false,
   decodeResult: null,
+  decodeToast: null,         // { message: string } | null; set on failure, cleared by component
   forcedDecoding: false,
   forcedDecodeResult: null,   // result from decode_forced(), null until user runs it
   pinnedCandidates: {},       // { [lrpIdx]: { segment_id, traversal, arc_offset_m, snap_lon, snap_lat } | null }
@@ -371,6 +372,7 @@ export const useStore = create(persist(
 
   hideResult:    () => set({ showResult: false }),
   toggleResult:  () => set(state => ({ showResult: !state.showResult })),
+  clearDecodeToast: () => set({ decodeToast: null }),
   clearResult: () => set({ decodeResult: null, showResult: false, highlightedSegment: null, traceHighlightSegIds: null, traceHighlightSnaps: null, traceLrpFocus: null, candidatePopup: null, llmApiHistory: [] }),
   setHighlightedSegment: (seg) => set({ highlightedSegment: seg }),
   // Request the segment info popup to open for a given tile+local_index.
@@ -644,10 +646,11 @@ export const useStore = create(persist(
       const replayData = result.trace?.events?.length
         ? buildReplaySteps(result.trace.events)
         : { steps: [], stats: null };
+      const toast = result.ok ? null : { message: result.error ?? 'Decode failed' };
       set({
         decoding: false,
         decodeResult: result,
-        showResult: true,
+        decodeToast: toast,
         replaySteps: replayData.steps,
         replayStats:  replayData.stats,
         replayStep:   0,
@@ -659,11 +662,12 @@ export const useStore = create(persist(
       // result.ok is a boolean iff WASM returned a proper DecodeResult.  Preserve it — it
       // carries lrps/trace we want to show.  The exception came from post-decode JS processing.
       if (result !== null && (result.ok === true || result.ok === false)) {
-        set({ decoding: false, decodeResult: result, showResult: true, replaySteps: [], replayStats: null, replayStep: 0 });
+        const toast = result.ok ? null : { message: result.error ?? 'Decode failed' };
+        set({ decoding: false, decodeResult: result, decodeToast: toast, replaySteps: [], replayStats: null, replayStep: 0 });
       } else {
         // WASM throws plain strings via JsValue::from_str; JS Error objects have .message.
         const errorMsg = e instanceof Error ? e.message : String(e);
-        set({ decoding: false, showResult: true, decodeResult: { ok: false, error: errorMsg, segments: [] } });
+        set({ decoding: false, decodeResult: { ok: false, error: errorMsg, segments: [] }, decodeToast: { message: errorMsg } });
       }
     }
   },
